@@ -1,0 +1,505 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>高性能网络 on Fain的Blog</title><link>https://knightofaxis.github.io/tags/%E9%AB%98%E6%80%A7%E8%83%BD%E7%BD%91%E7%BB%9C/</link><description>Recent content in 高性能网络 on Fain的Blog</description><generator>Hugo -- gohugo.io</generator><language>zh-cn</language><lastBuildDate>Sun, 05 Apr 2026 16:39:11 +0800</lastBuildDate><atom:link href="https://knightofaxis.github.io/tags/%E9%AB%98%E6%80%A7%E8%83%BD%E7%BD%91%E7%BB%9C/index.xml" rel="self" type="application/rss+xml"/><item><title>LLM 学习日志 #2 集合通信拓扑、原语和实现</title><link>https://knightofaxis.github.io/posts/20260405-collectivecommunication/</link><pubDate>Sun, 05 Apr 2026 16:39:11 +0800</pubDate><guid>https://knightofaxis.github.io/posts/20260405-collectivecommunication/</guid><description>&lt;p&gt;这篇博客主要是重温一下之前学过的集合通信的基本模式，包括拓扑、原语和实现。说是“重温”是因为这部分在之前学习NCCL的时候其实就都已经粗略的学习过了，但之后没有用到过，因此掌握不熟练、印象不深。现在趁着Pico-vLLM的开发机会，把这部分知识彻底的掌握起来。&lt;/p&gt;
+&lt;h2 id="集合通信的原语"&gt;集合通信的原语
+&lt;/h2&gt;&lt;h3 id="点对点p2p"&gt;点对点（P2P）
+&lt;/h3&gt;&lt;h3 id="broadcast"&gt;Broadcast
+&lt;/h3&gt;&lt;p&gt;Broadcast意味着一对多，一个GPU的数据广播给所有人。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A B C D] → GPU 0: [A B C D]
+GPU 1: [ ] GPU 1: [A B C D]
+GPU 2: [ ] GPU 2: [A B C D]
+GPU 3: [ ] GPU 3: [A B C D]
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="reduce"&gt;Reduce
+&lt;/h3&gt;&lt;p&gt;Reduce意味着多对一，所有GPU的数据归约到一个GPU。要注意的是它不是拼接而是运算，其最终得到的数据的数据量和原本每个GPU自己的数据量是相同的。Reduce本身并不是一个具体的操作，而是一系列具有特殊性质的规约算子的集合，其满足的性质是为&lt;strong&gt;可结合（associative）且通常可交换（commutative）的二元运算&lt;/strong&gt;。Reduce的常见算子包括了：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Sum（求和）&lt;/li&gt;
+&lt;li&gt;Prod（乘积）&lt;/li&gt;
+&lt;li&gt;Max / Min（极值）&lt;/li&gt;
+&lt;li&gt;Avg（平均）&lt;/li&gt;
+&lt;li&gt;BAND / BOR / BXOR（按位运算）&lt;/li&gt;
+&lt;li&gt;MinLoc / MaxLoc（极值+极值所在位置）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;LLM训练中99%的Reduce操作都是求和，其他算子出现的极少。NCCL甚至不支持MinLoc / MaxLoc操作。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A₀] → GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁] GPU 1: [ ]
+GPU 2: [A₂] GPU 2: [ ]
+GPU 3: [A₃] GPU 3: [ ]
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="all-reduce"&gt;All-Reduce
+&lt;/h3&gt;&lt;p&gt;All-Reduce意味着将所有GPU的数据归约，结果每个GPU都有一份完整拷贝。从逻辑上可以理解为先完成一个Reduce再完成一个Broadcast——实际上的操作在概念上类似但具体实现并不相同，同样是分解为两个阶段，但具体分解成的是Reduce-Scatter和All-Gather。&lt;/p&gt;
+&lt;p&gt;为什么不是一个Reduce+一个Broadcast？实际上，在早期的参数服务器模式下，&lt;strong&gt;确实就是&lt;/strong&gt;如此。但它有一个问题：可扩展性。Reduce 阶段所有数据汇聚到一个节点（CPU），Broadcast 阶段再从这一个节点（GPU）发出去。这个节点（GPU）的带宽成为整个操作的瓶颈，其他 GPU 在等待时空闲。Reduce-Scatter+All-Gather模式实际上是通过一个线性的偏移把每一个节点（GPU）变成了一个$1/N$的参数服务器，每个只负责和自己编号相同的第$K$块的数据的Reduce和Broadcast。在集合通信的视角下，这恰好就是Reduce-Scatter+All-Gather的模式。这样讲，可能在概念上是最容易理解的。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A₀] → GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁] GPU 1: [A₀+A₁+A₂+A₃]
+GPU 2: [A₂] GPU 2: [A₀+A₁+A₂+A₃]
+GPU 3: [A₃] GPU 3: [A₀+A₁+A₂+A₃]
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="reduce-scatter"&gt;Reduce-Scatter
+&lt;/h3&gt;&lt;p&gt;Reduce-Scatter操作意味着归约后，结果被切分，每个 GPU 只拿到一部分。但这种简化的描述方式实际上不完全准确，因为理解它在过程中的副产物，比理解它的开始状态和结束状态更有助于理解它是如何运作的。以最经典的ring为例子讲解，一张图会更容易帮助读者理解到底发生了什么：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;每步：每个 GPU 向下一个 GPU 发送一块数据，同时从上一个 GPU 接收一块并求和。
+规则：第 1 步发送自己编号对应的块，之后每步发送刚更新过的块。
+
+初始状态:
+ GPU 0: [A₀ B₀ C₀ D₀]
+ GPU 1: [A₁ B₁ C₁ D₁]
+ GPU 2: [A₂ B₂ C₂ D₂]
+ GPU 3: [A₃ B₃ C₃ D₃]
+
+第 1 步: GPU 0 ──A₀──→ GPU 1
+ GPU 1 ──B₁──→ GPU 2
+ GPU 2 ──C₂──→ GPU 3
+ GPU 3 ──D₃──→ GPU 0
+
+ GPU 0: [A₀ B₀ C₀ D₀+D₃ ]
+ GPU 1: [A₁+A₀ B₁ C₁ D₁ ]
+ GPU 2: [A₂ B₂+B₁ C₂ D₂ ]
+ GPU 3: [A₃ B₃ C₃+C₂ D₃ ]
+
+第 2 步: GPU 0 ──D₀₃──→ GPU 1 （发送刚更新的 D 块）
+ GPU 1 ──A₀₁──→ GPU 2 （发送刚更新的 A 块）
+ GPU 2 ──B₁₂──→ GPU 3 （发送刚更新的 B 块）
+ GPU 3 ──C₂₃──→ GPU 0 （发送刚更新的 C 块）
+
+ GPU 0: [A₀ B₀ C₀+C₂₃ D₀₃ ]
+ GPU 1: [A₀₁ B₁ C₁ D₁+D₀₃ ]
+ GPU 2: [A₂+A₀₁ B₁₂ C₂ D₂ ]
+ GPU 3: [A₃ B₃+B₁₂ C₂₃ D₃ ]
+
+第 3 步: GPU 0 ──C₀₂₃──→ GPU 1 （发送刚更新的 C 块）
+ GPU 1 ──D₀₁₃──→ GPU 2 （发送刚更新的 D 块）
+ GPU 2 ──A₀₁₂──→ GPU 3 （发送刚更新的 A 块）
+ GPU 3 ──B₁₂₃──→ GPU 0 （发送刚更新的 B 块）
+
+ GPU 0: [A₀ B₀₁₂₃=B_all C₀₂₃ D₀₃ ]
+ GPU 1: [A₀₁ B₁ C₀₁₂₃=C_all D₀₁₃ ]
+ GPU 2: [A₀₁₂ B₁₂ C₂ D₀₁₂₃=D_all]
+ GPU 3: [A₀₁₂₃=A_all B₁₂₃ C₂₃ D₃ ]
+规约完成。
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;因此，它的最终结果就是下图。但需要注意的是，它并不是一个没有副产物的操作。如果是原位操作的话，它实际上会修改每个GPU没有得到最终规约结果的相应数据位置，使得它不再是原本值，而是一个和自身rank决定的偏移量、数据偏移量都相关的部分累加和，也可以和某种意义上的前缀和相类比。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A₀ B₀ C₀ D₀] → GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁ B₁ C₁ D₁] GPU 1: [B₀+B₁+B₂+B₃]
+GPU 2: [A₂ B₂ C₂ D₂] GPU 2: [C₀+C₁+C₂+C₃]
+GPU 3: [A₃ B₃ C₃ D₃] GPU 3: [D₀+D₁+D₂+D₃]
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="all-gather"&gt;All-Gather
+&lt;/h3&gt;&lt;p&gt;每个GPU有一部分数据，收集后每个GPU都有完整数据。Ring All-Gather中没有任何归约（求和）操作，每个GPU拿到的块直接原样转发给下一个人就行。每步每个GPU把自己最近收到的完整块沿环传递，N-1步之后每个GPU就收集齐了所有块。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A] → GPU 0: [A B C D]
+GPU 1: [B] GPU 1: [A B C D]
+GPU 2: [C] GPU 2: [A B C D]
+GPU 3: [D] GPU 3: [A B C D]
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="all-to-all"&gt;All-to-All
+&lt;/h3&gt;&lt;p&gt;每个 GPU 向每个其他 GPU 发送不同的数据。由于其$O(n^2)$的通信连接数（有时候还有通信量）和复杂度，其被称为是“集群性能的试金石和考验”。它几乎总是可能引起拥塞。另一方面，大部分运行在集群上的应用都会尽量避免产生频繁的All-to-All通信，因为它很可能严重拉低相较于规整的集合通信模式下的集群性能。对All-to-All的通信优化算法和工程实践思路以处理其产生的拥塞控制为主。此外，就像上一篇的博客中对于MoE的介绍一样，许多All-to-All是动态的而非静态的，从而进一步加剧了这个问题。&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;GPU 0: [A₀ A₁ A₂ A₃] → GPU 0: [A₀ B₀ C₀ D₀]
+GPU 1: [B₀ B₁ B₂ B₃] GPU 1: [A₁ B₁ C₁ D₁]
+GPU 2: [C₀ C₁ C₂ C₃] GPU 2: [A₂ B₂ C₂ D₂]
+GPU 3: [D₀ D₁ D₂ D₃] GPU 3: [A₃ B₃ C₃ D₃]
+&lt;/code&gt;&lt;/pre&gt;&lt;h4 id="all-to-all-v"&gt;All-to-All-v
+&lt;/h4&gt;&lt;p&gt;每个 GPU 向每个其他 GPU 发送不同的数据，但收发的总数据量不一定每个都相同。&lt;/p&gt;
+&lt;h2 id="集合通信的常见拓扑"&gt;集合通信的常见拓扑
+&lt;/h2&gt;&lt;h3 id="ring环形"&gt;Ring（环形）
+&lt;/h3&gt;&lt;p&gt;最经典的集合通信的拓扑模式。&lt;/p&gt;
+&lt;p&gt;优点是&lt;strong&gt;带宽最优&lt;/strong&gt;——每个 GPU 的发送和接收带宽被充分利用，总通信量和 GPU 数无关（都是 2×(N-1)/N × 数据量）。&lt;/p&gt;
+&lt;p&gt;缺点是&lt;strong&gt;延迟随 GPU 数线性增长&lt;/strong&gt;——步数是 2(N-1)，GPU 越多步数越多。&lt;/p&gt;
+&lt;h3 id="tree树形"&gt;Tree（树形）
+&lt;/h3&gt;&lt;p&gt;优点是&lt;strong&gt;延迟最优&lt;/strong&gt;——只需 O(log N) 步。&lt;/p&gt;
+&lt;p&gt;缺点是带宽利用率不如 Ring——叶节点只参与部分通信，根节点成为瓶颈。&lt;/p&gt;
+&lt;h3 id="double-binary-tree"&gt;Double Binary Tree
+&lt;/h3&gt;&lt;p&gt;两棵互补的二叉树同时工作，结合了Tree的低延迟和更好的带宽利用率。NCCL在某些场景下会用这种策略。但其复杂且难以理解，而且对集群的节点数量有更严格的要求。&lt;/p&gt;
+&lt;h3 id="recursive-halving-doubling"&gt;Recursive Halving-Doubling
+&lt;/h3&gt;&lt;p&gt;递归地把GPU分成两半，先在小组内归约，再逐步扩大。兼顾延迟和带宽。&lt;/p&gt;
+&lt;h2 id="集合通信的常见实现"&gt;集合通信的常见实现
+&lt;/h2&gt;&lt;p&gt;XCCL：NCCL、HCCL、ACCL...许多初创的CCL通信库实际上都是直接魔改的NCCL。&lt;/p&gt;
+&lt;p&gt;NCCL 的 kernel 是沿三个维度&lt;strong&gt;预编译&lt;/strong&gt;的模板实例：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;算法（Algorithm）&lt;/strong&gt;：决定数据流动的拓扑模式&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Ring: 环形，带宽最优
+Tree: 树形（双二叉树），延迟最优
+CollnetDirect / CollnetChain: 利用 SHARP 等网内计算
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;协议（Protocol）&lt;/strong&gt;：决定数据传输的同步和打包方式&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Simple: 大块传输，高带宽，适合大消息
+LL: Low Latency，8 字节粒度，用 flag 做同步，适合小消息
+LL128: 128 字节粒度，利用 NVLink 的原子操作，延迟和带宽的折中
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;归约操作 × 数据类型&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Sum/Prod/Max/Min × FP16/BF16/FP32/FP64/INT8/...
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;这些维度的组合在编译时就被实例化成了大量的 kernel 变体。例如 Ring + Simple + Sum + FP16 是一个 kernel，Tree + LL128 + Max + FP32 是另一个 kernel。这也是为什么 NCCL 的编译时间很长。&lt;/p&gt;
+&lt;h3 id="cost-model运行时选择"&gt;Cost Model：运行时选择
+&lt;/h3&gt;&lt;p&gt;NCCL 的 cost model 是默认调优决策的核心。这个模型以时间为指标评估集合操作的开销，用于选择正确的协议和算法。cost model 考虑多种因素，包括数据量、GPU 架构、拓扑结构、网络和算法属性。&lt;/p&gt;
+&lt;p&gt;MSCCL：微软用的一种DSL，基于NCCL自定义通信算法。&lt;/p&gt;
+&lt;p&gt;MPI：太经典不讲。&lt;/p&gt;
+&lt;h2 id="硬件互联的数感建立"&gt;硬件互联的数感建立
+&lt;/h2&gt;&lt;p&gt;这一节列举常见网络和网卡设备的所有规格和速度，以帮助读者，包括写博客的我自己，建立对于网络的数字感知。&lt;/p&gt;
+&lt;h3 id="一gpu-节点内互联nvlink"&gt;一、GPU 节点内互联：NVLink
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;代际 首发GPU 每条链路带宽(双向) 每GPU链路数 每GPU总带宽(双向)
+NVLink 1.0 P100 40 GB/s 4 160 GB/s
+NVLink 2.0 V100 50 GB/s 6 300 GB/s
+NVLink 3.0 A100 50 GB/s 12 600 GB/s
+NVLink 4.0 H100 100 GB/s (注1) 18 900 GB/s
+NVLink 5.0 B200 100 GB/s 18 1,800 GB/s
+NVLink 6.0 Rubin 200 GB/s 18 3,600 GB/s
+
+注1: H100 的 NVLink 4.0 每条链路实际是 50 GB/s 双向，但 NVIDIA 在产品规格中
+ 按 sub-link 口径标注为 900 GB/s（18 sub-links × 50 GB/s）。
+ B200 的 NVLink 5.0 SerDes 速率翻倍，同样 18 条但每条 100 GB/s，所以总带宽 1.8 TB/s。
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="二gpu-节点内互联nvswitch"&gt;二、GPU 节点内互联：NVSwitch
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;代际 配套GPU 每芯片端口数 每芯片交换带宽 单节点GPU数 节点总NVLink带宽
+NVSwitch 1.0 V100 18 900 GB/s 8 (DGX-2) ~2.4 TB/s
+NVSwitch 2.0 A100 36 (注2) ~3.2 TB/s 8 (DGX A100) ~4.8 TB/s
+NVSwitch 3.0 H100 64 25.6 Tbps 8 (DGX H100) ~3.6 TB/s
+NVSwitch 4.0 B200 72 NVLink5 14.4 TB/s 72 (NVL72) ~130 TB/s (机柜级)
+
+注2: DGX A100 有 6 片 NVSwitch 2.0，每个 A100 的 12 条 NVLink 分别连到 6 片 NVSwitch
+ （每片 2 条），实现 8 GPU 全连接。
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;NVSwitch 3.0 (Hopper) 开始引入 &lt;strong&gt;SHARP&lt;/strong&gt;（Scalable Hierarchical Aggregation and Reduction Protocol），支持在交换芯片内部直接做归约计算（如 All-Reduce 的 sum），数据不需要绕回 GPU。&lt;/p&gt;
+&lt;p&gt;NVSwitch 4.0 (Blackwell) 把 NVLink 域从 8 GPU 扩展到了 &lt;strong&gt;72 GPU&lt;/strong&gt;（整个机柜），是一个质变——以前跨节点才需要 InfiniBand，现在机柜内全部走 NVLink。&lt;/p&gt;
+&lt;h3 id="三cpu-gpu-互联pcie"&gt;三、CPU-GPU 互联：PCIe
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;代际 发布年份 每通道速率 x16 单向带宽 x16 双向带宽
+PCIe 3.0 2010 8 GT/s ~16 GB/s ~32 GB/s
+PCIe 4.0 2017 16 GT/s ~32 GB/s ~64 GB/s
+PCIe 5.0 2019 32 GT/s ~64 GB/s ~128 GB/s
+PCIe 6.0 2022 64 GT/s ~128 GB/s ~256 GB/s
+PCIe 7.0 2025(规范) 128 GT/s ~256 GB/s ~512 GB/s
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;对比：H100 的 NVLink 总带宽 900 GB/s，而 PCIe 5.0 x16 双向才 128 GB/s，相差 &lt;strong&gt;7 倍&lt;/strong&gt;。这就是为什么 TP 必须走 NVLink 而不能走 PCIe。&lt;/p&gt;
+&lt;h3 id="四节点间互联infiniband"&gt;四、节点间互联：InfiniBand
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;代际 发布年份 每通道速率 4x 链路带宽 单/双向 典型网卡 典型交换机
+SDR 2001 2.5 Gbps 10 Gbps 单向 - -
+DDR 2005 5 Gbps 20 Gbps 单向 - -
+QDR 2007 10 Gbps 40 Gbps 单向 ConnectX-2/3 -
+FDR 2011 14 Gbps 56 Gbps 单向 ConnectX-3 SwitchX
+EDR 2014 25 Gbps 100 Gbps 单向 ConnectX-4/5 SwitchIB-2
+HDR 2019 50 Gbps 200 Gbps 单向 ConnectX-6 Quantum
+NDR 2022 100 Gbps 400 Gbps 单向 ConnectX-7 Quantum-2
+XDR 2025 200 Gbps 800 Gbps 单向 ConnectX-8 Quantum-X800
+GDR ~2028 400 Gbps 1.6 Tbps 单向 (规划中) (规划中)
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;换算成更直观的单位（双向）：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;EDR: ~25 GB/s 双向
+HDR: ~50 GB/s 双向
+NDR: ~100 GB/s 双向 ← 当前主流 AI 集群配置
+XDR: ~200 GB/s 双向 ← 2025 年开始部署
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;一台服务器通常配备&lt;strong&gt;多块网卡&lt;/strong&gt;。例如 DGX H100 配 8 张 ConnectX-7 NDR 400G 网卡，每 GPU 一张，节点间总带宽 = 8 × 100 GB/s = &lt;strong&gt;800 GB/s 双向&lt;/strong&gt;。即便如此，仍然只有 NVLink (900 GB/s) 的约 89%。&lt;/p&gt;
+&lt;h3 id="五节点间互联以太网roce"&gt;五、节点间互联：以太网（RoCE）
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;速率 双向带宽 延迟（典型） 备注
+10 GbE ~2.5 GB/s ~10-50 μs 传统数据中心
+25 GbE ~6.25 GB/s ~5-20 μs 
+40 GbE ~10 GB/s ~5-20 μs 
+100 GbE ~25 GB/s ~2-10 μs RoCEv2 常见配置
+200 GbE ~50 GB/s ~2-5 μs 
+400 GbE ~100 GB/s ~1-3 μs 正在部署
+800 GbE ~200 GB/s ~1-2 μs 2025 年开始
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;以太网 + RoCE（RDMA over Converged Ethernet）是 InfiniBand 的主要替代方案。带宽可以做到类似，但延迟通常高于 InfiniBand，且需要额外的拥塞控制（PFC/ECN）来模拟 IB 的无损特性。&lt;/p&gt;
+&lt;p&gt;NVIDIA 的 &lt;strong&gt;Spectrum-X&lt;/strong&gt; 平台就是基于以太网的 AI 网络方案，面向不想用 InfiniBand 的客户。&lt;/p&gt;
+&lt;h3 id="六带宽层级"&gt;六、带宽层级
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;带宽 (GB/s, 双向) 技术 用途
+─────────────────────────────────────────────────────────
+8,000 HBM3e (B200) GPU 内部显存带宽
+3,600 NVLink 6.0 (Rubin) 机柜内 GPU-GPU (未来)
+1,800 NVLink 5.0 (B200) 机柜内 GPU-GPU
+ 900 NVLink 4.0 (H100) 节点内 GPU-GPU
+ 800 8×NDR IB (DGX H100) 节点间总带宽
+ 600 NVLink 3.0 (A100) 节点内 GPU-GPU
+ 200 XDR IB (单卡) 节点间单卡带宽
+ 128 PCIe 5.0 x16 CPU-GPU
+ 100 NDR IB (单卡) 节点间单卡带宽
+ 50 HDR IB (单卡) 节点间单卡带宽
+ 25 EDR IB (单卡) 节点间单卡带宽 / 100GbE
+
+数量级关系:
+ HBM 带宽 &amp;gt; NVLink &amp;gt; 多卡 IB 总带宽 &amp;gt; 单卡 IB &amp;gt;&amp;gt; PCIe
+&lt;/code&gt;&lt;/pre&gt;&lt;h3 id="七延迟层级"&gt;七、延迟层级
+&lt;/h3&gt;&lt;p&gt;带宽之外，延迟同样重要：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;操作 典型延迟
+GPU 内部 SRAM (共享内存) 访问 ~几十 ns
+GPU HBM 访问 ~100-300 ns
+NVLink GPU-GPU ~1-2 μs
+PCIe GPU-CPU ~2-5 μs
+InfiniBand RDMA (节点间) ~1-3 μs
+RoCE (节点间) ~2-10 μs
+TCP/IP 以太网 (节点间) ~10-100 μs
+&lt;/code&gt;&lt;/pre&gt;</description></item><item><title>LLM 学习日志 #1 并行方案和通信模式</title><link>https://knightofaxis.github.io/posts/20260402-parallelism/</link><pubDate>Thu, 02 Apr 2026 17:20:54 +0800</pubDate><guid>https://knightofaxis.github.io/posts/20260402-parallelism/</guid><description>&lt;p&gt;在开始下一个阶段的开发之前，要先打好理论地基。虽然这部分之前零零散散的学过很多，但在通常的技术博客中通常只讲解每一种并行模式的技术原理和思想，将其和通信模式逐一详细联系起来并且做通信次数、数据量整合，甚至和反向传播的训练过程整合起来的并不多。&lt;/p&gt;
+&lt;p&gt;这篇文章打算稍微弥补一下这个问题，把所有零散的、常见或者不常见的并行切分方案，并且逐一评估其通信的需求、消耗、适用情况，在我的单人用户场景下，是否值得实现、实现难度如何。下面是总结。如果后面遇到了（甚至产生了）新的并行方案，也会一并记录在这里。&lt;/p&gt;
+&lt;p&gt;此外，在后面一篇博客当中，也会介绍一下每一种通信模式，以及通信模式对应的集群拓扑结构和相应常见的具体实现有哪些。&lt;/p&gt;
+&lt;h2 id="1tensor-parallelismtp-层内切分"&gt;1、Tensor Parallelism（TP）— 层内切分
+&lt;/h2&gt;&lt;p&gt;这个应该是最经典的并行方式了。 它的切分方式就是把每一层的权重矩阵沿着head或者hidden维度切到多卡上，每卡算一部分，合并结果。不同的卡持有不同的head、或者FFN的权重矩阵的不同部分。&lt;/p&gt;
+&lt;p&gt;特别值得一提的是，Megatron-LM中一种经典的做法是，FFN中有两个线性层，可以把第一个线性层（W_gate和W_up）按列切、第二个按行切。这样的好处是，在中间的计算过程中，中间结果不需要通信。&lt;/p&gt;
+&lt;p&gt;它的流程如下：先用被切分的，只有自己这部分head的W_Q、W_K、W_V矩阵乘以输入得到自己head的Q、K、V，然后用Attention算出自己head的输出，然后把自己的head送入按照同样模式切分的、自己本地的相应的W_o部分做乘法，得到一个部分和，然后进行all reduce。值得注意的是，由于切分是相同的，因此绕过了单卡情况下，对head的全局cat操作因此无需通信，只需要cat自己本地的head就可以了。all reduce之后，送入自己本地的第一个FFN权重，然后逐元素激活，送入第二个权重，算出本地部分和，然后进行第二次all reduce。&lt;/p&gt;
+&lt;p&gt;通信模式：All Reduce&lt;/p&gt;
+&lt;p&gt;通信次数：每个Transformer Block里有两次All-Reduce（Attention之后一次，FFN之后一次）。总共次数为2*模型层数。&lt;/p&gt;
+&lt;p&gt;通信量：每一层中，涉及到的需要通信的，相关的每层数据量 = batch_size × seq_len × hidden_size × dtype_bytes。在整个模型中，总数据量 = 每层数据量 × 2（每层两次） × layer_num（层数）。对于ring All-Reduce的情况，总通信量为总数据量 × TP 度 = 总数据量 × 2 × (n-1)/n。&lt;/p&gt;
+&lt;p&gt;涉及的模块：Attention、FFN&lt;/p&gt;
+&lt;p&gt;优点：
+1、可以达到很细的切分粒度，因为不同Head、FFN权重都可以切分，每张卡的显存占用可以按 TP 度线性减少。
+2、实现很成熟，是最早的并行模式之一，有现实的工业级别落地。
+3、天然是完全负载均衡的。&lt;/p&gt;
+&lt;p&gt;缺点：
+1、通信频率很高，对卡间带宽要求很高，产生的网络延迟在非NVlink的机内和机间基本不可接受
+2、切分过细的矩阵可能导致GEMM的算术强度降低，从而降低效率&lt;/p&gt;
+&lt;h3 id="训练中反向传播的情况"&gt;训练中反向传播的情况
+&lt;/h3&gt;&lt;p&gt;Megatron-LM给出了一个很漂亮的结论：对于所有前向的All-Reduce情况，在反向中的算子为Identity（不作数学操作，仅把同一个输入x复制到每张卡上）；对于所有的前向的Identity情况，在反向中的算子为。因此，在反向传播中，通信产生的次数和前向传播一模一样、数据量也相同，但出现的位置和前向传播相反。前向传播在结尾处做all reduce，而反向传播在开始处（当然同时是反向传播自己的结尾处）做all reduce。&lt;/p&gt;
+&lt;p&gt;这其实很符合直觉，简单推导即可得到，在此按下不表。&lt;/p&gt;
+&lt;p&gt;需要注意的是，反向传播的一个stage，在一般论文里大约占据两个slot，也就是两个时间步。换言之，被建模为前向传播的时间的两倍。&lt;/p&gt;
+&lt;h2 id="2pipeline-parallelismpp-层间切分"&gt;2、Pipeline Parallelism（PP）— 层间切分
+&lt;/h2&gt;&lt;h3 id="layer-分离--切分不同的transformer-block"&gt;Layer 分离 — 切分不同的Transformer Block
+&lt;/h3&gt;&lt;p&gt;最简单直接的并行模式。也就是直接把模型的不同层分配到不同卡上。例如，对于一个32层模型进行对4卡的PP，那么每一张卡恰好持有 8层。数据从第一卡计算完成后送入下一张卡，以此类推直到流向最后一卡，像流水线一样。&lt;/p&gt;
+&lt;p&gt;通信模式：点对点（Point-to-Point）&lt;/p&gt;
+&lt;p&gt;通信次数：整个前向传播过程中总通信次数N-1次，N为卡数。&lt;/p&gt;
+&lt;p&gt;通信量：每次切换卡，单次卡间通信量 = batch_size × seq_len × hidden_size × dtype_bytes，一次前向传播的总通信量 = num_gpus × 单次卡间通信量。&lt;/p&gt;
+&lt;p&gt;涉及的模块：不涉及具体模块，按卡的stage进行划分，粒度为layers。&lt;/p&gt;
+&lt;p&gt;优点：
+1、通信量小、频率低，可以其通信量和频率要求允许跨节点进行通信。
+2、实现简单、计算规整，可以保证层内计算和单卡完全相同，不产生任何浪费和算术强度降低。
+3、反向传播计算流和单卡情况相同，不需要对反向传播的组织模式进行特别的处理。&lt;/p&gt;
+&lt;p&gt;缺点：
+1、存在流水线空泡（Pipeline bubble）问题，流水线的启动。
+2、对于训练场景有额外的问题：反向传播需要反向流水线，交叉进行在简单的调度策略下会造成更多空泡，需要micro-batch、1F1B调度等等更复杂的策略。
+3、对于层数不能被卡数整除的场景，会产生负载不均衡。此外，首尾层的embedding/lm_head可能产生lagging。&lt;/p&gt;
+&lt;h4 id="训练中反向传播的情况-1"&gt;训练中反向传播的情况
+&lt;/h4&gt;&lt;p&gt;Pipeline Parallelism的反向传播在数学上和单卡完全一致，每个stage各自做标准的反向传播就行。但难点在于&lt;strong&gt;调度&lt;/strong&gt;：怎样安排各stage的前向和反向的执行顺序，使得GPU尽量少空闲。&lt;/p&gt;
+&lt;p&gt;需要了解的调度策略如下：&lt;/p&gt;
+&lt;p&gt;1、GPipe
+朴素方案。先把所有 micro-batch 的前向做完，再统一做反向。会产生很多空泡，而且需要保存大量的micro-batch的激活值。值得注意的是：重计算想法（只存储部分中间激活值以节省显存）也是在这部分研究当中一同产生的。&lt;/p&gt;
+&lt;p&gt;2、1F1B（One Forward One Backward）
+在第一个forward做完之后立刻开始第一个backward的反向过程，和后面的forward过程穿插。通过组织调度数学上可以保证每个stage在任意时刻最多只需缓存PP个micro-batch的激活值。它的核心是：在稳定阶段，每个&lt;/p&gt;
+&lt;p&gt;3、Interleaved 1F1B
+每个GPU不再持有连续的若干层而是持有总数相同但是在模型前向传播过程中&lt;strong&gt;不连续的层&lt;/strong&gt;。这等价于增加了stage的数量，只不过可能有多个stage在同一张卡上。比如PP=4的情况下，8层模型、interleave=2；那么第一个stage（gpu）持有0、4层，第二个stage持有1、5层，第三个stage持有2、6层，第四个stage持有3、7层。
+它的好处是可以通过很简单的方式增加流水线深度，从而允许更少的流水线空泡，坏处则很明显：大大增加了需要的通信量，进而增加了设备需求和延迟。&lt;/p&gt;
+&lt;p&gt;4、Zero-Bubble Pipeline
+这是一个很巧妙的想法。它把反向传播的过程中的成分做了更细粒度的划分。具体来说，反向传播其实包含两个独立的计算：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;B（backward for input）&lt;/strong&gt;：计算 ∂L/∂x，即对&lt;strong&gt;输入激活&lt;/strong&gt;的梯度&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;W（backward for weight）&lt;/strong&gt;：计算 ∂L/∂W，即对&lt;strong&gt;权重&lt;/strong&gt;的梯度&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;前者被前一个stage依赖的，前一个stage只有获得了B才能开始自己的反向传播计算过程。而后一个实际上是悬挂在依赖链上的分支，它依赖后一个stage的结果但本身并不被其他人依赖。W的结果只是累加到本stage的grad buffer里，等最后optimizer.step() 时用。它什么时候算都行，只要在optimizer.step()之前算完就行。那么一个自然的想法就是：能否先算有依赖的B，让后面的先开始，在有空的时候自己慢慢算W？答案是可以的。&lt;/p&gt;
+&lt;p&gt;通过手工调度，或者基于**ILP（整数线性规划）**求解的自动调度，可以最小化bubble的数量，甚至于接近0bubble的比例。当然，它实际上会引入一个问题：由于W延后，实际上一个step的总Latency变长了。但通过约束，可以完全保证跨step重叠至多在一个step以内，对训练收敛几乎没有可观测的影响。&lt;/p&gt;
+&lt;h3 id="prefill-decode-分离pd-disaggregation--切分请求的不同阶段"&gt;Prefill-Decode 分离（PD Disaggregation）— 切分请求的不同阶段
+&lt;/h3&gt;&lt;p&gt;Prefill 和 Decode 的计算特性完全不同：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Prefill: 大矩阵乘法，compute-bound，高算术强度，适合高算力卡
+Decode: 矩阵-向量乘，memory-bound，低算术强度，适合高带宽卡
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;混在一起跑会互相干扰。Decode的延迟敏感请求被Prefill的大计算堵住，Prefill的高吞吐被Decode的频繁小请求打断。&lt;/p&gt;
+&lt;p&gt;更进一步的说，两者的基本的算术强度就不同：Decode的算术强度一般可以估算为，FFN部分为engine中的batch数量的两倍（fp16或bf16意义下。fp8则乘以2）、Attention部分固定为1。实测数据显示，总体强度一般是&lt;strong&gt;40-90 FLOPs/byte&lt;/strong&gt;左右，远低于H100 BF16的ridge point 295。而Prefill的算术强度&lt;strong&gt;随着seq_len同步线性增长&lt;/strong&gt;，一般远远超过任何gpu的ridge point。&lt;/p&gt;
+&lt;h4 id="decode-阶段"&gt;Decode 阶段
+&lt;/h4&gt;&lt;h5 id="线性层ffnqkv-投影output-投影"&gt;线性层（FFN、QKV 投影、Output 投影）
+&lt;/h5&gt;&lt;p&gt;Decode 每步只生成 1 个 token，所以是矩阵-向量乘法（GEMV）：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;权重 W: [d, d]
+输入 x: [batch_size, d] （每个请求只有 1 个 token）
+
+FLOPs: 2 × batch_size × d²
+数据搬运: d² × bytes_per_param（权重）+ batch_size × d × bytes（输入，通常可忽略）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;权重远大于输入，所以：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;算术强度 ≈ 2 × batch_size / bytes_per_param
+&lt;/code&gt;&lt;/pre&gt;&lt;table&gt;
+ &lt;thead&gt;
+ &lt;tr&gt;
+ &lt;th&gt;精度&lt;/th&gt;
+ &lt;th&gt;batch=1&lt;/th&gt;
+ &lt;th&gt;batch=8&lt;/th&gt;
+ &lt;th&gt;batch=32&lt;/th&gt;
+ &lt;th&gt;batch=128&lt;/th&gt;
+ &lt;/tr&gt;
+ &lt;/thead&gt;
+ &lt;tbody&gt;
+ &lt;tr&gt;
+ &lt;td&gt;BF16 (2B)&lt;/td&gt;
+ &lt;td&gt;1&lt;/td&gt;
+ &lt;td&gt;8&lt;/td&gt;
+ &lt;td&gt;32&lt;/td&gt;
+ &lt;td&gt;128&lt;/td&gt;
+ &lt;/tr&gt;
+ &lt;tr&gt;
+ &lt;td&gt;FP8 (1B)&lt;/td&gt;
+ &lt;td&gt;2&lt;/td&gt;
+ &lt;td&gt;16&lt;/td&gt;
+ &lt;td&gt;64&lt;/td&gt;
+ &lt;td&gt;256&lt;/td&gt;
+ &lt;/tr&gt;
+ &lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h5 id="attentiondecode-的-score-计算"&gt;Attention（decode 的 score 计算）
+&lt;/h5&gt;&lt;p&gt;每个请求要用 1 个 query token 去和自己的整个 KV cache 做 attention：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Q: [batch_size, 1, d]
+K cache: [batch_size, seq_len, d] ← 每个请求有独立的 KV cache
+
+FLOPs: 2 × batch_size × seq_len × d
+数据搬运: batch_size × seq_len × d × bytes（KV cache，每个请求各自的）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;注意 KV cache 不能跨请求共享（每个请求的上下文不同），所以 batch 增大时数据搬运也等比增大：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;算术强度 ≈ 2 / bytes_per_element ≈ 1（BF16）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;不随 batch size 增长&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;而Prefill的算术强度可以如此计算：&lt;/p&gt;
+&lt;h4 id="prefill-阶段"&gt;Prefill 阶段
+&lt;/h4&gt;&lt;h5 id="线性层"&gt;线性层
+&lt;/h5&gt;&lt;p&gt;Prefill一次处理整个 prompt，所以是矩阵-矩阵乘法（GEMM）：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;权重 W: [d, d]
+输入 X: [batch_size × seq_len, d]
+
+FLOPs: 2 × batch_size × seq_len × d²
+数据搬运: d² × bytes_per_param（权重）
+ + batch_size × seq_len × d × bytes（输入激活）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;当 batch_size × seq_len 足够大时，权重搬运的成本被大量计算分摊掉：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;算术强度 ≈ 2 × batch_size × seq_len / bytes_per_param
+&lt;/code&gt;&lt;/pre&gt;&lt;table&gt;
+ &lt;thead&gt;
+ &lt;tr&gt;
+ &lt;th&gt;精度&lt;/th&gt;
+ &lt;th&gt;seq=1024, batch=1&lt;/th&gt;
+ &lt;th&gt;seq=4096, batch=1&lt;/th&gt;
+ &lt;th&gt;seq=4096, batch=4&lt;/th&gt;
+ &lt;/tr&gt;
+ &lt;/thead&gt;
+ &lt;tbody&gt;
+ &lt;tr&gt;
+ &lt;td&gt;BF16 (2B)&lt;/td&gt;
+ &lt;td&gt;512&lt;/td&gt;
+ &lt;td&gt;2048&lt;/td&gt;
+ &lt;td&gt;8192&lt;/td&gt;
+ &lt;/tr&gt;
+ &lt;tr&gt;
+ &lt;td&gt;FP8 (1B)&lt;/td&gt;
+ &lt;td&gt;1024&lt;/td&gt;
+ &lt;td&gt;4096&lt;/td&gt;
+ &lt;td&gt;16384&lt;/td&gt;
+ &lt;/tr&gt;
+ &lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;这些数字远远超过任何 GPU 的 ridge point。所以 &lt;strong&gt;Prefill 的线性层基本都是 compute-bound&lt;/strong&gt;。&lt;/p&gt;
+&lt;h5 id="attentionprefill-的-self-attention"&gt;Attention（prefill 的 self-attention）
+&lt;/h5&gt;&lt;p&gt;Prefill 中 Q、K、V 的长度都是 seq_len：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;Q: [batch_size, seq_len, d]
+K: [batch_size, seq_len, d]
+
+Q×K^T 的 FLOPs: 2 × batch_size × seq_len² × d_head × num_heads
+数据搬运: batch_size × seq_len × d × bytes × 3（Q, K, V）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;算术强度大约是：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;算术强度 ≈ seq_len / (3 × bytes_per_element)
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;这些差异是如此的明显，以至于这个disaggreation是最先被提出的。因此，分离之后各自可以针对性地优化硬件配置和调度策略。&lt;/p&gt;
+&lt;h3 id="attention-ffn分离af-disaggregation-切分transformer的不同阶段"&gt;Attention-FFN分离（AF Disaggregation）— 切分Transformer的不同阶段
+&lt;/h3&gt;&lt;p&gt;AF分离是一个相对来说更新的分离模式，而其和MoE的诞生关系密切，是一个很细粒度的分离。这是因为Expert的“专家”指的就是不同FFN的专家，它们共享Attention的所有参数，但各自具有各自的FFN层和相应参数。更进一步的说，两者占据显存的东西并不相同，Attention部分主要是因为KV Cache占据了大量显存，KV cache在不同卡之间的来回拷贝可能造成Attention性能的严重下降；而FFN中，权重占据了显存的绝大多数（甚至可以达到80%以上）。对于一个MoE来说，显存的膨胀同时也允许（或者说需求了）更细粒度的分离模式。此外，MoE的通信模式本身就需要大量的、不规则的、不可预知的点对点通信，Attention→FFN的传输可以和All-to-All的dispatch合并成一步，这意味着AF分离的边际代价相较于dense模型的情况减少了。反正都是无法避免要付出的，不如一口气全做完。&lt;/p&gt;
+&lt;p&gt;总的来说，Attention更倾向于小TP度（保持GEMM效率，减少KV cache副本和通信，而且Attention并没有非常庞大的参数量导致的需求），而FFN/Expert想要大EP度（容纳更多expert）。可以说MoE天然适合AF分离——既在动机上需要它（Attention和Expert的并行度不匹配），又在代价上容忍它（All-to-All吸收了额外通信）。&lt;/p&gt;
+&lt;h2 id="3data-parallelismdp-请求间切分"&gt;3、Data Parallelism（DP）— 请求间切分
+&lt;/h2&gt;&lt;p&gt;这应该是最朴素的并行了，朴素到不需要怎么讲。它的复杂度不在于推理（推理就完全是不同的实例在独自工作，无通信），而是在于训练的冗余参数存储的优化，这里诞生了许多大模型训练重要的早期成果——Google Brain、ImageNet、GPT-2、BERT，一直到单个模型在单卡上彻底放不下为止。&lt;/p&gt;
+&lt;p&gt;通信模式：推理无（训练则是All Reduce（经典训练DP）/All-Gather（ZeRO-1）/Reduce-Scatter（ZeRO-2）/两者（ZeRO-3））&lt;/p&gt;
+&lt;p&gt;通信次数：推理0，训练则是每个训练步 2 次集合通信（1 次 Reduce-Scatter + 1 次 All-Gather）（ZeRO-1）/ L+1 次集合通信（L 次 Reduce-Scatter（反向传播中逐层做）+ 1 次 All-Gather（更新后同步权重））（ZeRO-2）/ 3L 次集合通信（前向 1 次 All-Gather + 反向 1 次 All-Gather + 反向 1 次 Reduce-Scatter）（ZeRO-3）。&lt;/p&gt;
+&lt;p&gt;通信量：推理0，训练则是2 × Φ（可训练参数量） × dtype_bytes（经典DP和ZeRO-1和ZeRO-2）/ 3 × Φ（可训练参数量） × dtype_bytes（ZeRO-3）。&lt;/p&gt;
+&lt;p&gt;涉及的模块：推理无，训练涉及到优化器状态（ZeRO-1）、梯度状态（ZeRO-2）和权重（ZeRO-3）。&lt;/p&gt;
+&lt;p&gt;优点：
+1、无敌简单和容易理解。
+2、推理完全无通信开销。
+3、天然是完全负载均衡的。&lt;/p&gt;
+&lt;p&gt;缺点：
+1、对大模型的一个卡装不下的情况毫无帮助。
+2、训练的反向传播过程依然需要通信。&lt;/p&gt;
+&lt;h3 id="训练中反向传播的情况-2"&gt;训练中反向传播的情况
+&lt;/h3&gt;&lt;p&gt;这是ZeRO-1、2、3和FSDP大显身手的地方。&lt;/p&gt;
+&lt;h5 id="zero-1切分优化器状态"&gt;ZeRO-1：切分优化器状态
+&lt;/h5&gt;&lt;p&gt;&lt;strong&gt;切分方式&lt;/strong&gt;：优化器状态（Adam 的 m 和 v）按参数均分到 N 张卡。权重和梯度每卡完整保存。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信模式&lt;/strong&gt;：Reduce-Scatter + All-Gather&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信过程&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;反向传播结束后:
+ 1. Reduce-Scatter 梯度
+ 每卡得到自己负责的那 1/N 参数的聚合梯度
+ 通信量: Φ × dtype_bytes（每卡发出完整梯度，收到 1/N）
+
+ 2. 每卡用聚合梯度更新自己那 1/N 的参数（本地操作，无通信）
+
+ 3. All-Gather 更新后的权重
+ 每卡把自己更新的 1/N 权重广播出去，收集到完整权重
+ 通信量: Φ × dtype_bytes
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;通信次数&lt;/strong&gt;：每个训练步 2 次集合通信（1 次 Reduce-Scatter + 1 次 All-Gather）&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;每步总通信量&lt;/strong&gt;：2Φ × dtype_bytes（和经典 DP 的 All-Reduce 相同）&lt;/p&gt;
+&lt;h5 id="zero-2切分优化器状态--梯度"&gt;ZeRO-2：切分优化器状态 + 梯度
+&lt;/h5&gt;&lt;p&gt;&lt;strong&gt;切分方式&lt;/strong&gt;：优化器状态和梯度都按参数均分到 N 张卡。权重每卡完整保存。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信模式&lt;/strong&gt;：Reduce-Scatter + All-Gather&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信过程&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;反向传播中（逐层）:
+ 1. 每层算完梯度后立刻做 Reduce-Scatter
+ 每卡只保留自己负责的 1/N 梯度，其余丢弃
+ → 梯度显存从 2Φ 降到 2Φ/N
+
+反向传播全部结束后:
+ 2. 每卡更新自己负责的 1/N 参数（本地操作）
+
+ 3. All-Gather 更新后的权重
+ 通信量: Φ × dtype_bytes
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;通信次数&lt;/strong&gt;：每个训练步 = L 次 Reduce-Scatter（反向传播中逐层做）+ 1 次 All-Gather（更新后同步权重）&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;每步总通信量&lt;/strong&gt;：2Φ × dtype_bytes（仍然和经典 DP 相同）&lt;/p&gt;
+&lt;h5 id="zero-3--fsdp切分优化器状态--梯度--权重"&gt;ZeRO-3 / FSDP：切分优化器状态 + 梯度 + 权重
+&lt;/h5&gt;&lt;p&gt;&lt;strong&gt;切分方式&lt;/strong&gt;：优化器状态、梯度、权重全部按参数均分到 N 张卡。每卡只存 1/N。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信模式&lt;/strong&gt;：All-Gather + Reduce-Scatter（前向和反向每层都要做）&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信过程&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;前向传播（逐层）:
+ 对于第 i 层:
+ 1. All-Gather 收集完整权重 通信量: Φ_i × dtype_bytes
+ 2. 用完整权重做前向计算
+ 3. 丢弃非本卡的权重（释放显存）
+
+反向传播（逐层，从后向前）:
+ 对于第 i 层:
+ 4. All-Gather 再次收集完整权重 通信量: Φ_i × dtype_bytes
+ 5. 计算梯度
+ 6. 丢弃非本卡的权重
+ 7. Reduce-Scatter 梯度 通信量: Φ_i × dtype_bytes
+ 每卡只保留自己负责的 1/N
+
+全部反向结束后:
+ 8. 每卡更新自己的 1/N 参数（本地操作，无通信）
+ （不需要额外 All-Gather 同步权重，因为下一步的前向会自动收集）
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;通信次数&lt;/strong&gt;：每层 3 次集合通信（前向 1 次 All-Gather + 反向 1 次 All-Gather + 反向 1 次 Reduce-Scatter），总计 3L 次&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;每步总通信量&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;前向 All-Gather: Φ × dtype_bytes （所有层加起来）
+反向 All-Gather: Φ × dtype_bytes
+反向 Reduce-Scatter: Φ × dtype_bytes
+──────────────────────────────────────
+总计: 3Φ × dtype_bytes
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;比经典 DP / ZeRO-1 / ZeRO-2 的 2Φ 多了 &lt;strong&gt;50%&lt;/strong&gt;。多出来的就是前向传播中那一次 All-Gather——因为权重也切了，前向时也要收集。&lt;/p&gt;
+&lt;h2 id="4expert-parallelismep-专家参数间切分"&gt;4、Expert Parallelism（EP）— 专家参数间切分
+&lt;/h2&gt;&lt;p&gt;这个同样是相对来说很容易理解的一种并行模式，也是MoE的必然选择，可以说这个并行模式和MoE架构是严格相互绑定的。这么做的主要原因有两个：第一，Expert的总量非常大，导致相同量级的MoE模型，计算量低得多，但所有Expert加起来的参数量远大于dense模型，导致模型根本不可能放在同一张卡上；第二，这些expert之间是独立的，不同token去不同的expert，中间过程不需要通信或者拼接，天然适合分布到不同卡上。&lt;/p&gt;
+&lt;p&gt;通信模式：All-to-All-v（数据量不规则）&lt;/p&gt;
+&lt;p&gt;通信次数：每个 MoE 层: 2 次 All-to-All（dispatch + combine），非 MoE 层（如 Attention）: 按 TP 的通信模式（All-Reduce）。&lt;/p&gt;
+&lt;p&gt;通信量：不可精确预测。每次All-to-All的通信量取决于token的分发模式，进一步地取决于router。理想均匀情况下:&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;每个 GPU 持有 batch_size × seq_len 个 token
+每个 token 选 top-k 个 expert
+总共需要分发的 token 数: batch_size × seq_len × top_k
+其中留在本卡的比例: EP_degree 分之一
+需要发送的: batch_size × seq_len × top_k × (1 - 1/EP) × hidden_size × dtype_bytes 
+
+每个 MoE 层: 上述 × 2（dispatch + combine）
+
+总通信量: 上述 × MoE层数。
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;但实际情况往往（高度）不均匀，热门 expert 收到的 token 多，冷门 expert 收到的少。&lt;/p&gt;
+&lt;p&gt;涉及的模块：FFN。&lt;/p&gt;
+&lt;p&gt;优点：
+1、可以在不让计算量增加到难以承受程度的情况下，获得接近大参数量模型的性能。
+2、切分粒度可以非常高。&lt;/p&gt;
+&lt;p&gt;缺点：
+1、几乎总是一定有明显的负载不均衡，且无法在离线情况下静态的提前规划调度。
+2、对显存的需求非常非常大。
+3、训练比dense模型更加困难。&lt;/p&gt;
+&lt;p&gt;负载不均衡是MoE最难以处理的问题。Router是动态的，每个batch的token分发模式都不同。某些expert可能突然变&amp;quot;热门&amp;quot;，收到大量 token，而其他expert空闲。这会造成GPU的lagging情况，从而拖慢整个集群的性能。EP也是唯一一个通信模式&lt;strong&gt;动态变化&lt;/strong&gt;的并行策略。这使得它的优化比其他并行困难得多，因为没法提前知道每一步的通信模式是什么样的。对它的调度策略比起前面的精密的线性规划模式，可能更接近于时序预测、控制论、排队论、资源调度等等范畴。可以想见，关于MoE模型的网络设计、集群设计、调度策略设计将会比前面的模式更有可以做的地方，可能也需要更长的时间才能在工业界收敛到一个相对来说足够优秀的统一策略，也可能根本不收敛。&lt;/p&gt;
+&lt;h3 id="训练中反向传播的情况-3"&gt;训练中反向传播的情况
+&lt;/h3&gt;&lt;p&gt;EP的训练问题并不在于技术上的问题——在DP、PP、TP等模式里已经基本上完全解决了。它面对的是专家坍缩和辅助负载均衡损失等等问题。它指的是一种Expert之间的马太效应：Router是可学习的，它在训练过程中会&amp;quot;偏心&amp;quot;——逐渐把越来越多的token路由给少数几个 expert，其他expert收到的token越来越少，最终几乎不参与计算。这是一个正反馈循环：某个expert因为偶然收到更多token，得到更多训练，变得更强，router就更倾向于选它，它就收到更多token……最终模型退化成一个dense模型，MoE的容量优势完全消失。更详细的介绍超出了这篇博客的范畴，因此就不多讲了。&lt;/p&gt;
+&lt;p&gt;此外，值得一提的是，Router的top-k选择是一个&lt;strong&gt;离散操作&lt;/strong&gt;（不可微），但我们需要梯度回传。常用的做法是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;对被选中的expert，正常回传梯度&lt;/li&gt;
+&lt;li&gt;对没被选中的expert，梯度为零（它们根本没参与计算）&lt;/li&gt;
+&lt;li&gt;Router的梯度通过加权系数（gating weight）回传——这些系数是连续的、可微的&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这意味着router的训练信号只来自被选中的expert，它对未选中expert的&amp;quot;好坏&amp;quot;一无所知。这也是expert collapse的一个根源。&lt;/p&gt;
+&lt;h2 id="5sequence-parallelism-sp--序列维度切分"&gt;5、Sequence Parallelism （SP） — 序列维度切分
+&lt;/h2&gt;&lt;p&gt;SP是基于前文提到的TP的一种改进（同时也必须在TP的基础上做，无法单独存在。此外，它的名字实在是容易引起误解），它处理的是非FFN和非Attention的、没有被TP切割的地方，如LayerNorm的激活值、Dropout的激活值、残差连接的激活值等等，当然也是一个训练专门使用的优化手段。这是因为，激活值存储这个问题在推理里根本不存在。SP优美的地方在于，它不增加通信量，而是通过拆解通信原语的方式无代价的获得收益——也许可以被称为一种通信的Kernel Fusion？&lt;/p&gt;
+&lt;p&gt;回顾TP用到的通信模式：每个Attention/FFN模块结束时做一次&lt;strong&gt;All-Reduce&lt;/strong&gt;。而在底层通信原语的逻辑上，All-Reduce其实一般是拆成两步实现的：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;All-Reduce = Reduce-Scatter + All-Gather
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;SP 把这个拆分利用起来了：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;不用 SP 时:
+ TP 模块结束 → All-Reduce → 每卡得到完整结果 → LayerNorm(完整)
+
+用 SP 时:
+ TP 模块结束 → Reduce-Scatter → 每卡得到 1/N 的结果 → LayerNorm(1/N)
+ → 下一个 TP 模块开始前 → All-Gather → 收集完整输入 → TP 计算
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;strong&gt;通信模式&lt;/strong&gt;：Reduce-Scatter + All-Gather（替代 TP 原本的 All-Reduce）&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;通信次数&lt;/strong&gt;：和 TP 相同，每个 Transformer Block 4 次集合通信（前向 2 次 + 反向 2 次），只是把 All-Reduce 拆成了 RS + AG&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;总通信量&lt;/strong&gt;：Reduce-Scatter + All-Gather = All-Reduce。通过把All-Reduce拆分和还原，做到了在不增加额外开销的情况下减少大量激活值存储。&lt;/p&gt;
+&lt;h2 id="6context-parallelism-cp--长序列-attention-切分"&gt;6、Context Parallelism （CP） — 长序列 Attention 切分
+&lt;/h2&gt;&lt;p&gt;这是最近比较新的一种并行模式。CP应该是目前主流并行策略中&lt;strong&gt;最新加入&lt;/strong&gt;的一维。Llama 3的训练就用了4D并行：TP + CP + PP + DP，CP 是第四维。&lt;/p&gt;
+&lt;p&gt;CP和Ring Attention技术密切相关。它是把输入序列沿token维度切分到多张卡上。每卡只持有序列的一段，以此实现利用并行性来加速的效果。&lt;/p&gt;
+&lt;p&gt;对于非Attention的操作（FFN、LayerNorm等），token之间没有交互，每卡独立计算自己的部分即可，完全不需要通信。唯一需要通信的是 Attention，因为每个token的Query需要和所有token的Key、Value交互。&lt;/p&gt;
+&lt;p&gt;Meta 在Attention模块中实现了两种CP变体，通常被称为Ring Attention。&lt;/p&gt;
+&lt;h3 id="pass-kv经典ring-attention"&gt;Pass-KV（经典Ring Attention）
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;每卡保留自己的 Q 不动
+K、V 块在 GPU 之间沿环传递
+每轮：用本地 Q 和收到的 KV 块计算部分 Attention
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;标准Ring Attention，适合大多数场景。&lt;/p&gt;
+&lt;h3 id="pass-q反向传递"&gt;Pass-Q（反向传递）
+&lt;/h3&gt;&lt;pre tabindex="0"&gt;&lt;code&gt;每卡保留自己的 K、V 不动
+Q 块在 GPU 之间沿环传递
+每轮：用收到的 Q 和本地 KV 计算部分 Attention
+&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;Pass-Q在某些特定场景下更优。当KV cache命中率低于5%时，Pass-KV更优。&lt;/p&gt;</description></item></channel></rss>

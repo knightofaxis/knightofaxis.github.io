@@ -1,0 +1,367 @@
+<!doctype html><html lang=zh-cn dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='今天的主要成果是写了一个pseudo的Continous Batching框架。pseudo的意思是，engine内部的调用其实仍然是按照loop的模式一个个进行，但scheduler的功能本身是完善的，step模式的完整流程也已经写完。这么做主要是因为paged Attention本身作为框架的必须组件还没有实现——在实现paged Attention的过程中，从GQAAttention算子的模式本身到engine到KV cache的cache类和BlockManager全部都得重构或者从头开始写——因此在一个必然要推翻的框架内写一版必然要在接下来几天内全部重构的代码没什么意义，不如接下来直接实现完整的既有paged又有batching的版本。\n毕竟我又没有交付压力🤓。\nContinous Batching是什么 是一种可以增加推理框架调度效率的方法。在这个技术普及之前，Batching作为提高推理效率的技术已经被广泛应用。因此，要首先理解Batching在推理当中为什么可以提高推理效率。\n一些博客或者技术分享可能会说Batching能提高算术强度什么的，但这其实是一种误解，提高算术强度的技术是speculative decoding，而不是Batching技术。这是因为Batching产生的矩阵其实是对角线分块的：互相并不产生计算交叠，反而会产生大量0的空洞，这一点（在naive Kernel里）通过Attention mask遮盖。同时，KV cache本身的访问也是不会减少的，每一个之前算过的依然要完整读一遍。它最大的意义其实在于减少了权重的读取次数——原本计算一个sequence，吐一个token就要从主存（低层次的存储层次）读一遍完整的权重到高层次当中，现在计算$N$个sequence才需要读一遍，中间的过程均驻留在高层次存储里不离开。对于权重很大的大模型来说，这个效率提升其实是非常重要的。从这个角度来说，Continous Batching计的优化思想根基和GEMM矩阵乘法的优化也没有根本性的差别——计算机基本原理，加速大概率事件和有效利用时空局部性的又一个良好体现。\nBatching产生了另一个问题：不同的sequence不太可能是同等长度的，而且不太可能同时吐出eos，到达停止状态。将类似长度的sequence打包在一起可以部分地解决第一个问题，但不能解决第二个问题，这个问题同样被后面要做的paged Attention大部分地解决。这就导致一个结果：在一个batch中的一部分sequence已经吐出了eos，变成停止状态了，而另外一些则没有。只要一个sequence还在跑，整个batch是不能停止的。这个时候，batch可能反而变成负收益：许多读写已经是完全空转的了，只是为了陪跑还在自回归过程的sequence，但内存读写消耗反而一点也没有减少。Continous Batching解决的是第二个问题。\n所以实际上，Continous Batching和paged Attention本就是深度耦合的两个技术：如果没有paged Attention，Continous Batching每次都要完整的重新分配和整理内存，那么Continous Batching本身就毫无意义了。反过来说，没有Batching和Continous Batching，在单序列请求下，内存碎片这个问题可能还没有那么严重，paged Attention的威力也完全无法有效发挥。试想：在有了paged Attention之后，Continous Batching其实完全不需要进行任何内存操作：只需要把换出的sequence的KV cache页表索引换掉，变成下一个sequence的就可以了，也就是说对sequence本身其实无感知。这也难怪这两件事被同一时间提出，作者在研究的过程中很可能遇到了这个问题然后把它想明白了。\nContinous Batching的设计、实现和调度策略 其实这个技术的基本实现也在思路上比较顺畅。它的基本思想是把所有sequence分成waiting、prefilling、decoding和finished四种状态（也有的实现是waiting、running和finished三种，取决于你如何写你的推理engine和kernel，两者是耦合的），以及engine的step模式设计。通过一个scheduler的调度，scheduler管理所有请求、赋予每一个请求一个unique的id编号，并且决定下一个step处理哪些，如何改变序列的状态，并且维持每个step内的负载大致均衡。engine则负责进行prefilling、decoding，并且检查decoding序列中的情况，将已经达到max_len的和已经生成出eos的序列中的sequence移出，进入finished，而finished则负责记录生成的结果、等待外部请求获取，并且提供将finished队列清空的方法，实际上是为了方便外部请求的设计。\n在这个过程中有意思的反而是scheduler的调度策略设计：由于prefilling和decoding的计算资源需求并不相同（其实这里已经初步开始产生PD分离的思想了：异质化的负载调度总是比较难处理的），scheduler如何同时确保效率和公平性就是一个问题。prefilling一次应该多少？decoding一次应该多少？这个问题相当open，理论上来说应该是相当值得研究的（尤其是对于生产环境、ToC环境来说，因为它会极大的影响TTFT指标）。在目前的版本中，为了简单起见，实现的是先到先服务（FCFS）和Prefilling+Decoding中的sequence数量总和固定。这是一个粗糙的调度，不过对于框架的可运行性没有影响。也许后面可以考虑把策略拿出来单独设计。\nContinous Batching的相关代码 主要的类有两个，分别是Request和Scheduler。Request记录一个请求的基本信息，Scheduler基于前者的基本信息进行调度。需要注意的是，在我的框架里我本人选择了把KVcache和Request放在一起管理。其他框架似乎不是这样，但按这个模式似乎也没什么问题。\nRequest类：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 class RequestStatus(Enum): WAITING = "waiting" # 在 waiting 队列，还没做 prefill PREFILL = "prefill" # 本步正在做 prefill DECODING = "decoding" # 已经 prefill 完，正在 decode FINISHED = "finished" # 已完成 &#39;&#39;&#39; 请求对象，包含请求的所有信息和状态 - request_id: 请求 ID，唯一标识一个请求 - input_ids: 输入的 token ids，shape (1, init_seq_len)，包含整个 prompt - generated_ids: 已经生成的 token ids，shape (1, )，初始为 空 - max_new_tokens: 最多生成多少个 token - temperature: 采样温度，传递给 sampler - top_p: top-p 截断，传递给 sampler - kv_cache: 每个请求独享一个 KV cache 实例，存储生成过程中的 KV 状态 &#39;&#39;&#39; class Request: request_id: int input_ids: List[int] # (1, init_seq_len)，包含整个 prompt generated_ids: List[int] # (1, )，包含已经生成的 token ids，初始为 空 max_new_tokens: int temperature: float top_p: float kv_cache: Optional[KVCache] # 每个请求独享一个 KV cache 实例 request_status: RequestStatus has_eos_token: bool # 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新 def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float): self.request_id = request_id self.input_ids = input_ids self.generated_ids = [] # 初始为 空 self.request_status = RequestStatus.WAITING self.max_new_tokens = max_new_tokens self.temperature = temperature self.top_p = top_p self.kv_cache = None self.has_finished_notification = False # engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列 def is_max_len_finished(self) -> bool: return len(self.generated_ids) >= self.max_new_tokens @property def prompt_len(self) -> int: return len(self.input_ids) @property def total_len(self) -> int: return len(self.input_ids) + len(self.generated_ids) Scheduler类：\n'><title>Pico-vLLM 开发日志 #4 Continous Batching</title><link rel=canonical href=https://knightofaxis.github.io/posts/20260326-continousbatching/><link rel=preconnect href=https://fonts.googleapis.com><link rel=preconnect href=https://fonts.gstatic.com crossorigin><link rel=preload as=style href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap"><link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap"><link rel=stylesheet href=/scss/style.min.6bf79b2ae61c7ba8e62d3e21035ac47f8019793860d8b6ad3a39a56fc20975a5.css><meta property='og:title' content="Pico-vLLM 开发日志 #4 Continous Batching"><meta property='og:description' content='今天的主要成果是写了一个pseudo的Continous Batching框架。pseudo的意思是，engine内部的调用其实仍然是按照loop的模式一个个进行，但scheduler的功能本身是完善的，step模式的完整流程也已经写完。这么做主要是因为paged Attention本身作为框架的必须组件还没有实现——在实现paged Attention的过程中，从GQAAttention算子的模式本身到engine到KV cache的cache类和BlockManager全部都得重构或者从头开始写——因此在一个必然要推翻的框架内写一版必然要在接下来几天内全部重构的代码没什么意义，不如接下来直接实现完整的既有paged又有batching的版本。\n毕竟我又没有交付压力🤓。\nContinous Batching是什么 是一种可以增加推理框架调度效率的方法。在这个技术普及之前，Batching作为提高推理效率的技术已经被广泛应用。因此，要首先理解Batching在推理当中为什么可以提高推理效率。\n一些博客或者技术分享可能会说Batching能提高算术强度什么的，但这其实是一种误解，提高算术强度的技术是speculative decoding，而不是Batching技术。这是因为Batching产生的矩阵其实是对角线分块的：互相并不产生计算交叠，反而会产生大量0的空洞，这一点（在naive Kernel里）通过Attention mask遮盖。同时，KV cache本身的访问也是不会减少的，每一个之前算过的依然要完整读一遍。它最大的意义其实在于减少了权重的读取次数——原本计算一个sequence，吐一个token就要从主存（低层次的存储层次）读一遍完整的权重到高层次当中，现在计算$N$个sequence才需要读一遍，中间的过程均驻留在高层次存储里不离开。对于权重很大的大模型来说，这个效率提升其实是非常重要的。从这个角度来说，Continous Batching计的优化思想根基和GEMM矩阵乘法的优化也没有根本性的差别——计算机基本原理，加速大概率事件和有效利用时空局部性的又一个良好体现。\nBatching产生了另一个问题：不同的sequence不太可能是同等长度的，而且不太可能同时吐出eos，到达停止状态。将类似长度的sequence打包在一起可以部分地解决第一个问题，但不能解决第二个问题，这个问题同样被后面要做的paged Attention大部分地解决。这就导致一个结果：在一个batch中的一部分sequence已经吐出了eos，变成停止状态了，而另外一些则没有。只要一个sequence还在跑，整个batch是不能停止的。这个时候，batch可能反而变成负收益：许多读写已经是完全空转的了，只是为了陪跑还在自回归过程的sequence，但内存读写消耗反而一点也没有减少。Continous Batching解决的是第二个问题。\n所以实际上，Continous Batching和paged Attention本就是深度耦合的两个技术：如果没有paged Attention，Continous Batching每次都要完整的重新分配和整理内存，那么Continous Batching本身就毫无意义了。反过来说，没有Batching和Continous Batching，在单序列请求下，内存碎片这个问题可能还没有那么严重，paged Attention的威力也完全无法有效发挥。试想：在有了paged Attention之后，Continous Batching其实完全不需要进行任何内存操作：只需要把换出的sequence的KV cache页表索引换掉，变成下一个sequence的就可以了，也就是说对sequence本身其实无感知。这也难怪这两件事被同一时间提出，作者在研究的过程中很可能遇到了这个问题然后把它想明白了。\nContinous Batching的设计、实现和调度策略 其实这个技术的基本实现也在思路上比较顺畅。它的基本思想是把所有sequence分成waiting、prefilling、decoding和finished四种状态（也有的实现是waiting、running和finished三种，取决于你如何写你的推理engine和kernel，两者是耦合的），以及engine的step模式设计。通过一个scheduler的调度，scheduler管理所有请求、赋予每一个请求一个unique的id编号，并且决定下一个step处理哪些，如何改变序列的状态，并且维持每个step内的负载大致均衡。engine则负责进行prefilling、decoding，并且检查decoding序列中的情况，将已经达到max_len的和已经生成出eos的序列中的sequence移出，进入finished，而finished则负责记录生成的结果、等待外部请求获取，并且提供将finished队列清空的方法，实际上是为了方便外部请求的设计。\n在这个过程中有意思的反而是scheduler的调度策略设计：由于prefilling和decoding的计算资源需求并不相同（其实这里已经初步开始产生PD分离的思想了：异质化的负载调度总是比较难处理的），scheduler如何同时确保效率和公平性就是一个问题。prefilling一次应该多少？decoding一次应该多少？这个问题相当open，理论上来说应该是相当值得研究的（尤其是对于生产环境、ToC环境来说，因为它会极大的影响TTFT指标）。在目前的版本中，为了简单起见，实现的是先到先服务（FCFS）和Prefilling+Decoding中的sequence数量总和固定。这是一个粗糙的调度，不过对于框架的可运行性没有影响。也许后面可以考虑把策略拿出来单独设计。\nContinous Batching的相关代码 主要的类有两个，分别是Request和Scheduler。Request记录一个请求的基本信息，Scheduler基于前者的基本信息进行调度。需要注意的是，在我的框架里我本人选择了把KVcache和Request放在一起管理。其他框架似乎不是这样，但按这个模式似乎也没什么问题。\nRequest类：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 class RequestStatus(Enum): WAITING = "waiting" # 在 waiting 队列，还没做 prefill PREFILL = "prefill" # 本步正在做 prefill DECODING = "decoding" # 已经 prefill 完，正在 decode FINISHED = "finished" # 已完成 &#39;&#39;&#39; 请求对象，包含请求的所有信息和状态 - request_id: 请求 ID，唯一标识一个请求 - input_ids: 输入的 token ids，shape (1, init_seq_len)，包含整个 prompt - generated_ids: 已经生成的 token ids，shape (1, )，初始为 空 - max_new_tokens: 最多生成多少个 token - temperature: 采样温度，传递给 sampler - top_p: top-p 截断，传递给 sampler - kv_cache: 每个请求独享一个 KV cache 实例，存储生成过程中的 KV 状态 &#39;&#39;&#39; class Request: request_id: int input_ids: List[int] # (1, init_seq_len)，包含整个 prompt generated_ids: List[int] # (1, )，包含已经生成的 token ids，初始为 空 max_new_tokens: int temperature: float top_p: float kv_cache: Optional[KVCache] # 每个请求独享一个 KV cache 实例 request_status: RequestStatus has_eos_token: bool # 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新 def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float): self.request_id = request_id self.input_ids = input_ids self.generated_ids = [] # 初始为 空 self.request_status = RequestStatus.WAITING self.max_new_tokens = max_new_tokens self.temperature = temperature self.top_p = top_p self.kv_cache = None self.has_finished_notification = False # engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列 def is_max_len_finished(self) -> bool: return len(self.generated_ids) >= self.max_new_tokens @property def prompt_len(self) -> int: return len(self.input_ids) @property def total_len(self) -> int: return len(self.input_ids) + len(self.generated_ids) Scheduler类：\n'><meta property='og:url' content='https://knightofaxis.github.io/posts/20260326-continousbatching/'><meta property='og:site_name' content='Fain的Blog'><meta property='og:type' content='article'><meta property='article:section' content='Posts'><meta property='article:tag' content='vLLM'><meta property='article:tag' content='推理引擎'><meta property='article:published_time' content='2026-03-26T20:41:19+08:00'><meta property='article:modified_time' content='2026-03-26T20:41:19+08:00'><meta name=twitter:title content="Pico-vLLM 开发日志 #4 Continous Batching"><meta name=twitter:description content='今天的主要成果是写了一个pseudo的Continous Batching框架。pseudo的意思是，engine内部的调用其实仍然是按照loop的模式一个个进行，但scheduler的功能本身是完善的，step模式的完整流程也已经写完。这么做主要是因为paged Attention本身作为框架的必须组件还没有实现——在实现paged Attention的过程中，从GQAAttention算子的模式本身到engine到KV cache的cache类和BlockManager全部都得重构或者从头开始写——因此在一个必然要推翻的框架内写一版必然要在接下来几天内全部重构的代码没什么意义，不如接下来直接实现完整的既有paged又有batching的版本。\n毕竟我又没有交付压力🤓。\nContinous Batching是什么 是一种可以增加推理框架调度效率的方法。在这个技术普及之前，Batching作为提高推理效率的技术已经被广泛应用。因此，要首先理解Batching在推理当中为什么可以提高推理效率。\n一些博客或者技术分享可能会说Batching能提高算术强度什么的，但这其实是一种误解，提高算术强度的技术是speculative decoding，而不是Batching技术。这是因为Batching产生的矩阵其实是对角线分块的：互相并不产生计算交叠，反而会产生大量0的空洞，这一点（在naive Kernel里）通过Attention mask遮盖。同时，KV cache本身的访问也是不会减少的，每一个之前算过的依然要完整读一遍。它最大的意义其实在于减少了权重的读取次数——原本计算一个sequence，吐一个token就要从主存（低层次的存储层次）读一遍完整的权重到高层次当中，现在计算$N$个sequence才需要读一遍，中间的过程均驻留在高层次存储里不离开。对于权重很大的大模型来说，这个效率提升其实是非常重要的。从这个角度来说，Continous Batching计的优化思想根基和GEMM矩阵乘法的优化也没有根本性的差别——计算机基本原理，加速大概率事件和有效利用时空局部性的又一个良好体现。\nBatching产生了另一个问题：不同的sequence不太可能是同等长度的，而且不太可能同时吐出eos，到达停止状态。将类似长度的sequence打包在一起可以部分地解决第一个问题，但不能解决第二个问题，这个问题同样被后面要做的paged Attention大部分地解决。这就导致一个结果：在一个batch中的一部分sequence已经吐出了eos，变成停止状态了，而另外一些则没有。只要一个sequence还在跑，整个batch是不能停止的。这个时候，batch可能反而变成负收益：许多读写已经是完全空转的了，只是为了陪跑还在自回归过程的sequence，但内存读写消耗反而一点也没有减少。Continous Batching解决的是第二个问题。\n所以实际上，Continous Batching和paged Attention本就是深度耦合的两个技术：如果没有paged Attention，Continous Batching每次都要完整的重新分配和整理内存，那么Continous Batching本身就毫无意义了。反过来说，没有Batching和Continous Batching，在单序列请求下，内存碎片这个问题可能还没有那么严重，paged Attention的威力也完全无法有效发挥。试想：在有了paged Attention之后，Continous Batching其实完全不需要进行任何内存操作：只需要把换出的sequence的KV cache页表索引换掉，变成下一个sequence的就可以了，也就是说对sequence本身其实无感知。这也难怪这两件事被同一时间提出，作者在研究的过程中很可能遇到了这个问题然后把它想明白了。\nContinous Batching的设计、实现和调度策略 其实这个技术的基本实现也在思路上比较顺畅。它的基本思想是把所有sequence分成waiting、prefilling、decoding和finished四种状态（也有的实现是waiting、running和finished三种，取决于你如何写你的推理engine和kernel，两者是耦合的），以及engine的step模式设计。通过一个scheduler的调度，scheduler管理所有请求、赋予每一个请求一个unique的id编号，并且决定下一个step处理哪些，如何改变序列的状态，并且维持每个step内的负载大致均衡。engine则负责进行prefilling、decoding，并且检查decoding序列中的情况，将已经达到max_len的和已经生成出eos的序列中的sequence移出，进入finished，而finished则负责记录生成的结果、等待外部请求获取，并且提供将finished队列清空的方法，实际上是为了方便外部请求的设计。\n在这个过程中有意思的反而是scheduler的调度策略设计：由于prefilling和decoding的计算资源需求并不相同（其实这里已经初步开始产生PD分离的思想了：异质化的负载调度总是比较难处理的），scheduler如何同时确保效率和公平性就是一个问题。prefilling一次应该多少？decoding一次应该多少？这个问题相当open，理论上来说应该是相当值得研究的（尤其是对于生产环境、ToC环境来说，因为它会极大的影响TTFT指标）。在目前的版本中，为了简单起见，实现的是先到先服务（FCFS）和Prefilling+Decoding中的sequence数量总和固定。这是一个粗糙的调度，不过对于框架的可运行性没有影响。也许后面可以考虑把策略拿出来单独设计。\nContinous Batching的相关代码 主要的类有两个，分别是Request和Scheduler。Request记录一个请求的基本信息，Scheduler基于前者的基本信息进行调度。需要注意的是，在我的框架里我本人选择了把KVcache和Request放在一起管理。其他框架似乎不是这样，但按这个模式似乎也没什么问题。\nRequest类：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 class RequestStatus(Enum): WAITING = "waiting" # 在 waiting 队列，还没做 prefill PREFILL = "prefill" # 本步正在做 prefill DECODING = "decoding" # 已经 prefill 完，正在 decode FINISHED = "finished" # 已完成 &#39;&#39;&#39; 请求对象，包含请求的所有信息和状态 - request_id: 请求 ID，唯一标识一个请求 - input_ids: 输入的 token ids，shape (1, init_seq_len)，包含整个 prompt - generated_ids: 已经生成的 token ids，shape (1, )，初始为 空 - max_new_tokens: 最多生成多少个 token - temperature: 采样温度，传递给 sampler - top_p: top-p 截断，传递给 sampler - kv_cache: 每个请求独享一个 KV cache 实例，存储生成过程中的 KV 状态 &#39;&#39;&#39; class Request: request_id: int input_ids: List[int] # (1, init_seq_len)，包含整个 prompt generated_ids: List[int] # (1, )，包含已经生成的 token ids，初始为 空 max_new_tokens: int temperature: float top_p: float kv_cache: Optional[KVCache] # 每个请求独享一个 KV cache 实例 request_status: RequestStatus has_eos_token: bool # 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新 def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float): self.request_id = request_id self.input_ids = input_ids self.generated_ids = [] # 初始为 空 self.request_status = RequestStatus.WAITING self.max_new_tokens = max_new_tokens self.temperature = temperature self.top_p = top_p self.kv_cache = None self.has_finished_notification = False # engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列 def is_max_len_finished(self) -> bool: return len(self.generated_ids) >= self.max_new_tokens @property def prompt_len(self) -> int: return len(self.input_ids) @property def total_len(self) -> int: return len(self.input_ids) + len(self.generated_ids) Scheduler类：\n'><script>(function(){const e=(new Date).getHours();let t="";e>=5&&e<10?t="/img/morning.png":e>=10&&e<15?t="/img/noon.png":e>=15&&e<20?t="/img/evening.png":t="/img/night.png",document.documentElement.style.setProperty("--bg-image",`url(${t})`)})()</script></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><figure class=site-avatar><a href=/><img src=/img/avatar.jpg width=350 height=350 class=site-logo loading=lazy alt=Avatar>
+</a><span class=emoji>🍥</span></figure><div class=site-meta><h1 class=site-name><a href=/>Fain的Blog</a></h1><h2 class=site-description>博士生在读，vLLM绝赞学习中，目标是成为世一码</h2></div></header><ol class=menu id=main-menu><li><a href=/><span>首页</span></a></li><li><a href=/posts/><span>文章</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav class=toc-nav id=TableOfContents><ul><li><a href=#continous-batching是什么>Continous Batching是什么</a></li><li><a href=#continous-batching的设计实现和调度策略>Continous Batching的设计、实现和调度策略</a></li><li><a href=#continous-batching的相关代码>Continous Batching的相关代码</a></li></ul></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%BC%80%E5%8F%91%E6%97%A5%E5%BF%97/ style=background-color:#bebeef;color:#0f0f3d>开发日志</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/posts/20260326-continousbatching/>Pico-vLLM 开发日志 #4 Continous Batching</a></h2></div><footer class=article-meta><div class=inline-meta><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published datetime=2026-03-26T20:41:19+08:00>Thursday, March 26, 2026</time>
+<svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>4 minutes read</time></div></footer></div></header><aside class=article-toc><details><summary><div class=article-toc-title><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-chevron-right"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M9 6l6 6-6 6"/></svg>
+<span>Table of contents</span></div></summary><nav class=toc-nav><ul><li><a href=#continous-batching是什么>Continous Batching是什么</a></li><li><a href=#continous-batching的设计实现和调度策略>Continous Batching的设计、实现和调度策略</a></li><li><a href=#continous-batching的相关代码>Continous Batching的相关代码</a></li></ul></nav></details></aside><section class=article-content><p>今天的主要成果是写了一个pseudo的Continous Batching框架。pseudo的意思是，engine内部的调用其实仍然是按照loop的模式一个个进行，但scheduler的功能本身是完善的，step模式的完整流程也已经写完。这么做主要是因为paged Attention本身作为框架的必须组件还没有实现——在实现paged Attention的过程中，从GQAAttention算子的模式本身到engine到KV cache的cache类和BlockManager全部都得重构或者从头开始写——因此在一个必然要推翻的框架内写一版必然要在接下来几天内全部重构的代码没什么意义，不如接下来直接实现完整的既有paged又有batching的版本。</p><p>毕竟我又没有交付压力🤓。</p><h2 id=continous-batching是什么>Continous Batching是什么</h2><p>是一种可以增加推理框架调度效率的方法。在这个技术普及之前，Batching作为提高推理效率的技术已经被广泛应用。因此，要首先理解Batching在推理当中为什么可以提高推理效率。</p><p>一些博客或者技术分享可能会说Batching能提高算术强度什么的，但这其实是一种误解，提高算术强度的技术是speculative decoding，而不是Batching技术。这是因为Batching产生的矩阵其实是对角线分块的：互相并不产生计算交叠，反而会产生大量0的空洞，这一点（在naive Kernel里）通过Attention mask遮盖。同时，KV cache本身的访问也是不会减少的，每一个之前算过的依然要完整读一遍。它最大的意义其实在于减少了权重的读取次数——原本计算一个sequence，吐一个token就要从主存（低层次的存储层次）读一遍完整的权重到高层次当中，现在计算$N$个sequence才需要读一遍，中间的过程均驻留在高层次存储里不离开。对于权重很大的大模型来说，这个效率提升其实是非常重要的。从这个角度来说，Continous Batching计的优化思想根基和GEMM矩阵乘法的优化也没有根本性的差别——计算机基本原理，加速大概率事件和有效利用时空局部性的又一个良好体现。</p><p>Batching产生了另一个问题：不同的sequence不太可能是同等长度的，而且不太可能同时吐出eos，到达停止状态。将类似长度的sequence打包在一起可以部分地解决第一个问题，但不能解决第二个问题，这个问题同样被后面要做的paged Attention大部分地解决。这就导致一个结果：在一个batch中的一部分sequence已经吐出了eos，变成停止状态了，而另外一些则没有。只要一个sequence还在跑，整个batch是不能停止的。这个时候，batch可能反而变成负收益：许多读写已经是完全空转的了，只是为了陪跑还在自回归过程的sequence，但内存读写消耗反而一点也没有减少。Continous Batching解决的是第二个问题。</p><p>所以实际上，Continous Batching和paged Attention本就是深度耦合的两个技术：如果没有paged Attention，Continous Batching每次都要完整的重新分配和整理内存，那么Continous Batching本身就毫无意义了。反过来说，没有Batching和Continous Batching，在单序列请求下，内存碎片这个问题可能还没有那么严重，paged Attention的威力也完全无法有效发挥。试想：在有了paged Attention之后，Continous Batching其实完全不需要进行任何内存操作：只需要把换出的sequence的KV cache页表索引换掉，变成下一个sequence的就可以了，也就是说对sequence本身其实无感知。这也难怪这两件事被同一时间提出，作者在研究的过程中很可能遇到了这个问题然后把它想明白了。</p><h2 id=continous-batching的设计实现和调度策略>Continous Batching的设计、实现和调度策略</h2><p>其实这个技术的基本实现也在思路上比较顺畅。它的基本思想是把所有sequence分成waiting、prefilling、decoding和finished四种状态（也有的实现是waiting、running和finished三种，取决于你如何写你的推理engine和kernel，两者是耦合的），以及engine的step模式设计。通过一个scheduler的调度，scheduler管理所有请求、赋予每一个请求一个unique的id编号，并且决定下一个step处理哪些，如何改变序列的状态，并且维持每个step内的负载大致均衡。engine则负责进行prefilling、decoding，并且检查decoding序列中的情况，将已经达到max_len的和已经生成出eos的序列中的sequence移出，进入finished，而finished则负责记录生成的结果、等待外部请求获取，并且提供将finished队列清空的方法，实际上是为了方便外部请求的设计。</p><p>在这个过程中有意思的反而是scheduler的调度策略设计：由于prefilling和decoding的计算资源需求并不相同（其实这里已经初步开始产生PD分离的思想了：异质化的负载调度总是比较难处理的），scheduler如何同时确保效率和公平性就是一个问题。prefilling一次应该多少？decoding一次应该多少？这个问题相当open，理论上来说应该是相当值得研究的（尤其是对于生产环境、ToC环境来说，因为它会极大的影响TTFT指标）。在目前的版本中，为了简单起见，实现的是先到先服务（FCFS）和Prefilling+Decoding中的sequence数量总和固定。这是一个粗糙的调度，不过对于框架的可运行性没有影响。也许后面可以考虑把策略拿出来单独设计。</p><h2 id=continous-batching的相关代码>Continous Batching的相关代码</h2><p>主要的类有两个，分别是Request和Scheduler。Request记录一个请求的基本信息，Scheduler基于前者的基本信息进行调度。需要注意的是，在我的框架里我本人选择了把KVcache和Request放在一起管理。其他框架似乎不是这样，但按这个模式似乎也没什么问题。</p><p>Request类：</p><div class=highlight><div style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><table style=border-spacing:0;padding:0;margin:0;border:0><tr><td style=vertical-align:top;padding:0;margin:0;border:0><pre tabindex=0 style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">47
+</span></code></pre></td><td style=vertical-align:top;padding:0;margin:0;border:0;width:100%><pre tabindex=0 style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><code class=language-python data-lang=python><span style=display:flex><span><span style=color:#66d9ef>class</span> <span style=color:#a6e22e>RequestStatus</span>(Enum):
+</span></span><span style=display:flex><span>    WAITING  <span style=color:#f92672>=</span> <span style=color:#e6db74>&#34;waiting&#34;</span>   <span style=color:#75715e># 在 waiting 队列，还没做 prefill</span>
+</span></span><span style=display:flex><span>    PREFILL  <span style=color:#f92672>=</span> <span style=color:#e6db74>&#34;prefill&#34;</span>   <span style=color:#75715e># 本步正在做 prefill</span>
+</span></span><span style=display:flex><span>    DECODING <span style=color:#f92672>=</span> <span style=color:#e6db74>&#34;decoding&#34;</span>  <span style=color:#75715e># 已经 prefill 完，正在 decode</span>
+</span></span><span style=display:flex><span>    FINISHED <span style=color:#f92672>=</span> <span style=color:#e6db74>&#34;finished&#34;</span>  <span style=color:#75715e># 已完成</span>
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span><span style=color:#e6db74>&#39;&#39;&#39; 请求对象，包含请求的所有信息和状态
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- request_id: 请求 ID，唯一标识一个请求
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- input_ids: 输入的 token ids，shape (1, init_seq_len)，包含整个 prompt
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- generated_ids: 已经生成的 token ids，shape (1, )，初始为 空
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- max_new_tokens: 最多生成多少个 token
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- temperature: 采样温度，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- top_p: top-p 截断，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>- kv_cache: 每个请求独享一个 KV cache 实例，存储生成过程中的 KV 状态
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>&#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span><span style=color:#66d9ef>class</span> <span style=color:#a6e22e>Request</span>:
+</span></span><span style=display:flex><span>    request_id: int
+</span></span><span style=display:flex><span>    input_ids: List[int]  <span style=color:#75715e># (1, init_seq_len)，包含整个 prompt</span>
+</span></span><span style=display:flex><span>    generated_ids: List[int]  <span style=color:#75715e># (1, )，包含已经生成的 token ids，初始为 空</span>
+</span></span><span style=display:flex><span>    max_new_tokens: int
+</span></span><span style=display:flex><span>    temperature: float
+</span></span><span style=display:flex><span>    top_p: float
+</span></span><span style=display:flex><span>    kv_cache: Optional[KVCache]  <span style=color:#75715e># 每个请求独享一个 KV cache 实例</span>
+</span></span><span style=display:flex><span>    request_status: RequestStatus
+</span></span><span style=display:flex><span>    has_eos_token: bool  <span style=color:#75715e># 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新</span>
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>__init__</span>(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float):
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>request_id <span style=color:#f92672>=</span> request_id
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>input_ids <span style=color:#f92672>=</span> input_ids
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>generated_ids <span style=color:#f92672>=</span> []  <span style=color:#75715e># 初始为 空</span>
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>request_status <span style=color:#f92672>=</span> RequestStatus<span style=color:#f92672>.</span>WAITING
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>max_new_tokens <span style=color:#f92672>=</span> max_new_tokens
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>temperature <span style=color:#f92672>=</span> temperature
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>top_p <span style=color:#f92672>=</span> top_p
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>kv_cache <span style=color:#f92672>=</span> <span style=color:#66d9ef>None</span>
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>has_finished_notification <span style=color:#f92672>=</span> <span style=color:#66d9ef>False</span> <span style=color:#75715e># engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列</span>
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>is_max_len_finished</span>(self) <span style=color:#f92672>-&gt;</span> bool:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>generated_ids) <span style=color:#f92672>&gt;=</span> self<span style=color:#f92672>.</span>max_new_tokens
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>prompt_len</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>input_ids)
+</span></span><span style=display:flex><span>    
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>  
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>total_len</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>input_ids) <span style=color:#f92672>+</span> len(self<span style=color:#f92672>.</span>generated_ids)
+</span></span></code></pre></td></tr></table></div></div><p>Scheduler类：</p><div class=highlight><div style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><table style=border-spacing:0;padding:0;margin:0;border:0><tr><td style=vertical-align:top;padding:0;margin:0;border:0><pre tabindex=0 style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">  9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 47
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 48
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 49
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 50
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 51
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 52
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 53
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 54
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 55
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 56
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 57
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 58
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 59
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 60
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 61
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 62
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 63
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 64
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 65
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 66
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 67
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 68
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 69
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 70
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 71
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 72
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 73
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 74
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 75
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 76
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 77
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 78
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 79
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 80
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 81
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 82
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 83
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 84
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 85
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 86
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 87
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 88
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 89
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 90
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 91
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 92
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 93
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 94
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 95
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 96
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 97
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 98
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f"> 99
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">100
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">101
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">102
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">103
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">104
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">105
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">106
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">107
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">108
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">109
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">110
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">111
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">112
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">113
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">114
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">115
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">116
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">117
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">118
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:.4em;padding:0 .4em;color:#7f7f7f">119
+</span></code></pre></td><td style=vertical-align:top;padding:0;margin:0;border:0;width:100%><pre tabindex=0 style=color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none><code class=language-python data-lang=python><span style=display:flex><span><span style=color:#66d9ef>class</span> <span style=color:#a6e22e>Scheduler</span>:
+</span></span><span style=display:flex><span>    _next_request_id: int  <span style=color:#75715e># 用于生成唯一的 request_id</span>
+</span></span><span style=display:flex><span>    max_num_seqs: int  <span style=color:#75715e># 同时处理的最大请求数，超过这个数的新请求会排队等待</span>
+</span></span><span style=display:flex><span>    kv_cache_cls : type[KVCache]  <span style=color:#75715e># KVCache 的类，用于创建请求的 KV cache 实例</span>
+</span></span><span style=display:flex><span>    kv_cache_kwargs <span style=color:#f92672>=</span> {}  <span style=color:#75715e># 创建 KV cache 实例的参数字典</span>
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    waiting: List[Request]    <span style=color:#75715e># 还没开始处理的请求</span>
+</span></span><span style=display:flex><span>    prefilling: List[Request]   <span style=color:#75715e># 正在 prefill 的请求</span>
+</span></span><span style=display:flex><span>    decoding: List[Request]     <span style=color:#75715e># 正在 decode 的请求</span>
+</span></span><span style=display:flex><span>    finished: List[Request]   <span style=color:#75715e># 已完成的请求</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>__init__</span>(self, kv_cache_cls: type[KVCache], kv_cache_kwargs<span style=color:#f92672>=</span>{}, _next_request_id: int <span style=color:#f92672>=</span> <span style=color:#ae81ff>0</span>, max_num_seqs: int <span style=color:#f92672>=</span> <span style=color:#ae81ff>4</span>):
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>_next_request_id <span style=color:#f92672>=</span> _next_request_id
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>max_num_seqs <span style=color:#f92672>=</span> max_num_seqs
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>kv_cache_cls <span style=color:#f92672>=</span> kv_cache_cls
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>kv_cache_kwargs <span style=color:#f92672>=</span> kv_cache_kwargs
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>waiting <span style=color:#f92672>=</span> []
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>prefilling <span style=color:#f92672>=</span> []
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>decoding <span style=color:#f92672>=</span> []
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>finished <span style=color:#f92672>=</span> []
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#e6db74>&#39;&#39;&#39; 插入新请求
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - input_ids: 输入的 token ids，shape (1, seq_len)，包含整个 prompt
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - max_new_tokens: 最多生成多少个 token
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - temperature: 采样温度，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - top_p: top-p 截断，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - cache_cls: KVCache 的类，用于创建请求的 KV cache 实例
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - cache_kwargs: 创建 KV cache 实例的参数字典
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    return: request_id，唯一标识一个请求&#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>insert_request</span>(self, 
+</span></span><span style=display:flex><span>                       input_ids: List[int], 
+</span></span><span style=display:flex><span>                       max_new_tokens: int, 
+</span></span><span style=display:flex><span>                       temperature: float, 
+</span></span><span style=display:flex><span>                       top_p: float, ) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        request <span style=color:#f92672>=</span> self<span style=color:#f92672>.</span>create_request(input_ids, max_new_tokens, temperature, top_p, self<span style=color:#f92672>.</span>kv_cache_cls, self<span style=color:#f92672>.</span>kv_cache_kwargs)
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>add_request(request)
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> request<span style=color:#f92672>.</span>request_id
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#e6db74>&#39;&#39;&#39;&#39; 创建新的请求对象
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - input_ids: 输入的 token ids，shape (1, seq_len)，包含整个 prompt
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - max_new_tokens: 最多生成多少个 token
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - temperature: 采样温度，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - top_p: top-p 截断，传递给 sampler
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - cache_cls: KVCache 的类，用于创建请求的 KV cache 实例
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - cache_kwargs: 创建 KV cache 实例的参数字典
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    return: request_id，唯一标识一个请求&#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>create_request</span>(self, 
+</span></span><span style=display:flex><span>            input_ids: List[int], 
+</span></span><span style=display:flex><span>            max_new_tokens: int, 
+</span></span><span style=display:flex><span>            temperature: float, 
+</span></span><span style=display:flex><span>            top_p: float, 
+</span></span><span style=display:flex><span>            cache_cls, 
+</span></span><span style=display:flex><span>            cache_kwargs) <span style=color:#f92672>-&gt;</span> Request:
+</span></span><span style=display:flex><span>        request_id <span style=color:#f92672>=</span> self<span style=color:#f92672>.</span>_next_request_id
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>_next_request_id <span style=color:#f92672>+=</span> <span style=color:#ae81ff>1</span>
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> Request(request_id, input_ids, max_new_tokens, temperature, top_p)
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#e6db74>&#39;&#39;&#39;&#39; 添加新请求到等待队列
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - request: 新的请求对象
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    &#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>add_request</span>(self, request: Request):
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>waiting<span style=color:#f92672>.</span>append(request)
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#e6db74>&#39;&#39;&#39; 调度器主循环
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    return: 2个列表，分别是当前处于 prefilling、decoding 状态的请求列表
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - prefilling: 正在 prefill 的请求
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    - decoding: 正在 decode 的请求
+</span></span></span><span style=display:flex><span><span style=color:#e6db74>    &#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>schedule</span>(self) <span style=color:#f92672>-&gt;</span> tuple[List[Request], List[Request]]:
+</span></span><span style=display:flex><span>        
+</span></span><span style=display:flex><span>        <span style=color:#75715e># 1. 对 decoding 队列中的请求进行 decode，完成后移动到 finished 队列</span>
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>for</span> request <span style=color:#f92672>in</span> self<span style=color:#f92672>.</span>decoding[:]:
+</span></span><span style=display:flex><span>            <span style=color:#75715e># is_max_len_finished 由 scheduler判断</span>
+</span></span><span style=display:flex><span>            <span style=color:#75715e># has_finished_notification 由 engine 在 decode_step 后更新，解耦两者的逻辑，scheduler 不直接接触 tokenizer 和 eos_token_id</span>
+</span></span><span style=display:flex><span>            <span style=color:#66d9ef>if</span> request<span style=color:#f92672>.</span>has_finished_notification <span style=color:#f92672>==</span> <span style=color:#66d9ef>True</span>:
+</span></span><span style=display:flex><span>                request<span style=color:#f92672>.</span>request_status <span style=color:#f92672>=</span> RequestStatus<span style=color:#f92672>.</span>FINISHED
+</span></span><span style=display:flex><span>                self<span style=color:#f92672>.</span>decoding<span style=color:#f92672>.</span>remove(request)
+</span></span><span style=display:flex><span>                self<span style=color:#f92672>.</span>finished<span style=color:#f92672>.</span>append(request)
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>        <span style=color:#75715e># 2. 对 prefilling 队列中的请求进行 prefill，完成后移动到 decoding 队列</span>
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>for</span> request <span style=color:#f92672>in</span> self<span style=color:#f92672>.</span>prefilling[:]:
+</span></span><span style=display:flex><span>            <span style=color:#75715e># prefill 完成后：</span>
+</span></span><span style=display:flex><span>            request<span style=color:#f92672>.</span>request_status <span style=color:#f92672>=</span> RequestStatus<span style=color:#f92672>.</span>DECODING
+</span></span><span style=display:flex><span>            self<span style=color:#f92672>.</span>prefilling<span style=color:#f92672>.</span>remove(request)
+</span></span><span style=display:flex><span>            self<span style=color:#f92672>.</span>decoding<span style=color:#f92672>.</span>append(request)
+</span></span><span style=display:flex><span>        
+</span></span><span style=display:flex><span>        <span style=color:#75715e># 3. 从 waiting 队列中取出请求，放入 prefilling 队列，直到达到 max_batch_size</span>
+</span></span><span style=display:flex><span>        <span style=color:#75715e># 不进行kv_cache的创建和初始化</span>
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>while</span> self<span style=color:#f92672>.</span>waiting <span style=color:#f92672>and</span> self<span style=color:#f92672>.</span>num_in_progress <span style=color:#f92672>&lt;</span> self<span style=color:#f92672>.</span>max_num_seqs:
+</span></span><span style=display:flex><span>            <span style=color:#75715e># 先到先服务策略</span>
+</span></span><span style=display:flex><span>            request <span style=color:#f92672>=</span> self<span style=color:#f92672>.</span>waiting<span style=color:#f92672>.</span>pop(<span style=color:#ae81ff>0</span>)
+</span></span><span style=display:flex><span>            request<span style=color:#f92672>.</span>request_status <span style=color:#f92672>=</span> RequestStatus<span style=color:#f92672>.</span>PREFILL
+</span></span><span style=display:flex><span>            self<span style=color:#f92672>.</span>prefilling<span style=color:#f92672>.</span>append(request)
+</span></span><span style=display:flex><span>            <span style=color:#75715e># kv cache必须定长，否则报错</span>
+</span></span><span style=display:flex><span>            <span style=color:#75715e># request.kv_cache = self.kv_cache_cls(**self.kv_cache_kwargs)</span>
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> self<span style=color:#f92672>.</span>prefilling, self<span style=color:#f92672>.</span>decoding
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#e6db74>&#39;&#39;&#39;&#39; 清空 finished 队列，释放资源&#39;&#39;&#39;</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>clear_finished</span>(self):
+</span></span><span style=display:flex><span>        self<span style=color:#f92672>.</span>finished<span style=color:#f92672>.</span>clear()
+</span></span><span style=display:flex><span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>get_running_requests</span>(self) <span style=color:#f92672>-&gt;</span> List[Request]:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> self<span style=color:#f92672>.</span>prefilling <span style=color:#f92672>+</span> self<span style=color:#f92672>.</span>decoding
+</span></span><span style=display:flex><span>    
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>num_waiting</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>waiting)
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>num_prefilling</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>prefilling)
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>num_decoding</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>decoding)
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>num_in_progress</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>prefilling) <span style=color:#f92672>+</span> len(self<span style=color:#f92672>.</span>decoding)
+</span></span><span style=display:flex><span>    <span style=color:#a6e22e>@property</span>
+</span></span><span style=display:flex><span>    <span style=color:#66d9ef>def</span> <span style=color:#a6e22e>num_finished</span>(self) <span style=color:#f92672>-&gt;</span> int:
+</span></span><span style=display:flex><span>        <span style=color:#66d9ef>return</span> len(self<span style=color:#f92672>.</span>finished)
+</span></span></code></pre></td></tr></table></div></div><p>值得指出的是id用int是有明确缺陷的：str和uuid作为id很可能是更好的选项。在这里用int只是因为它简单，而且我的卡大概也不会有超过2147483647个请求。</p><p>测试一遍通过，这里就不贴了。接下来就是实现真正的paged Attention了，个人认为它的意义可能不太亚于KV cache本身，直接开启了一小个时代级别的想法。</p></section><footer class="article-meta article-footer"><section class=article-tags><a href=/tags/vllm/>VLLM</a>
+<a href=/tags/%E6%8E%A8%E7%90%86%E5%BC%95%E6%93%8E/>推理引擎</a></section></footer><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css integrity=sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV crossorigin=anonymous><script src=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js integrity=sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8 crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js integrity=sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05 crossorigin=anonymous defer></script><script>window.addEventListener("DOMContentLoaded",()=>{const e=[".main-article",".widget--toc"];e.forEach(e=>{const t=document.querySelector(e);t&&renderMathInElement(t,{delimiters:[{left:"$$",right:"$$",display:!0},{left:"$",right:"$",display:!1},{left:"\\(",right:"\\)",display:!1},{left:"\\[",right:"\\]",display:!0}],ignoredClasses:["gist"]})})})</script></article><aside><h2 class=section-title>Related content</h2><div class=subsection-list><div class=article-list--tile><article><a href=/posts/20260325-kvcache/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #3 KV cache</h2></div></a></article><article><a href=/posts/20260324-run/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #2 自回归和Profiling</h2></div></a></article><article><a href=/posts/20260322-sample/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #1 Sampler的设计</h2></div></a></article><article><a href=/posts/my-first-post/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #0 博客安装</h2></div></a></article></div></div></aside><div class=disqus-container></div><style>.disqus-container{background-color:var(--card-background);border-radius:var(--card-border-radius);box-shadow:var(--shadow-l1);padding:var(--card-padding)}</style><script>window.addEventListener("onColorSchemeChange",e=>{typeof DISQUS=="object"&&DISQUS.reset({reload:!0})})</script><footer class=site-footer><section class=copyright>&copy;
+2026 Fain的Blog</section><section class=powerby>Built with <a href=https://gohugo.io/ target=_blank rel=noopener>Hugo</a><br>Theme <b><a href=https://github.com/CaiJimmy/hugo-theme-stack target=_blank rel=noopener data-version=4.0.0>Stack</a></b> designed by <a href=https://jimmycai.com target=_blank rel=noopener>Jimmy</a></section></footer><script type=module>
+    import gallery from '\/ts\/gallery.js';
+
+    const articleContent = document.querySelector('.article-content');
+    const shouldLoad = articleContent && (articleContent.querySelectorAll('figure').length > 0 || articleContent.querySelectorAll('img.gallery-image').length > 0);
+    
+    if (shouldLoad) {
+        gallery(articleContent);
+
+        const PhotoSwipeLightbox = (await import("https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe-lightbox.esm.min.js")).default;
+        const styleHref = "https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe.css";
+
+        const styleTag = document.createElement('link');
+        styleTag.rel = 'stylesheet';
+        styleTag.href = styleHref;
+        document.head.appendChild(styleTag);
+
+        const lightbox = new PhotoSwipeLightbox({
+            gallerySelector: '.article-content',
+            childSelector: 'figure a.image-link',
+            pswpModule: () => import("https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe.esm.min.js")
+        });
+        lightbox.init();
+    }
+</script></main></div><script type=text/javascript src=/ts/main.acaf849f2b273f6a8368a58b001f336738d0c948d92e79b116467d0c7515f932.js defer></script></body></html>

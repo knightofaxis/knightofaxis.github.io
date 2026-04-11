@@ -1,0 +1,176 @@
+<!doctype html><html lang=zh-cn dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="这篇博客主要是重温一下之前学过的集合通信的基本模式，包括拓扑、原语和实现。说是“重温”是因为这部分在之前学习NCCL的时候其实就都已经粗略的学习过了，但之后没有用到过，因此掌握不熟练、印象不深。现在趁着Pico-vLLM的开发机会，把这部分知识彻底的掌握起来。\n集合通信的原语 点对点（P2P） Broadcast Broadcast意味着一对多，一个GPU的数据广播给所有人。\nGPU 0: [A B C D] → GPU 0: [A B C D] GPU 1: [ ] GPU 1: [A B C D] GPU 2: [ ] GPU 2: [A B C D] GPU 3: [ ] GPU 3: [A B C D] Reduce Reduce意味着多对一，所有GPU的数据归约到一个GPU。要注意的是它不是拼接而是运算，其最终得到的数据的数据量和原本每个GPU自己的数据量是相同的。Reduce本身并不是一个具体的操作，而是一系列具有特殊性质的规约算子的集合，其满足的性质是为可结合（associative）且通常可交换（commutative）的二元运算。Reduce的常见算子包括了：\nSum（求和） Prod（乘积） Max / Min（极值） Avg（平均） BAND / BOR / BXOR（按位运算） MinLoc / MaxLoc（极值+极值所在位置） LLM训练中99%的Reduce操作都是求和，其他算子出现的极少。NCCL甚至不支持MinLoc / MaxLoc操作。\nGPU 0: [A₀] → GPU 0: [A₀+A₁+A₂+A₃] GPU 1: [A₁] GPU 1: [ ] GPU 2: [A₂] GPU 2: [ ] GPU 3: [A₃] GPU 3: [ ] All-Reduce All-Reduce意味着将所有GPU的数据归约，结果每个GPU都有一份完整拷贝。从逻辑上可以理解为先完成一个Reduce再完成一个Broadcast——实际上的操作在概念上类似但具体实现并不相同，同样是分解为两个阶段，但具体分解成的是Reduce-Scatter和All-Gather。\n"><title>LLM 学习日志 #2 集合通信拓扑、原语和实现</title><link rel=canonical href=https://knightofaxis.github.io/posts/20260405-collectivecommunication/><link rel=preconnect href=https://fonts.googleapis.com><link rel=preconnect href=https://fonts.gstatic.com crossorigin><link rel=preload as=style href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap"><link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap"><link rel=stylesheet href=/scss/style.min.6bf79b2ae61c7ba8e62d3e21035ac47f8019793860d8b6ad3a39a56fc20975a5.css><meta property='og:title' content="LLM 学习日志 #2 集合通信拓扑、原语和实现"><meta property='og:description' content="这篇博客主要是重温一下之前学过的集合通信的基本模式，包括拓扑、原语和实现。说是“重温”是因为这部分在之前学习NCCL的时候其实就都已经粗略的学习过了，但之后没有用到过，因此掌握不熟练、印象不深。现在趁着Pico-vLLM的开发机会，把这部分知识彻底的掌握起来。\n集合通信的原语 点对点（P2P） Broadcast Broadcast意味着一对多，一个GPU的数据广播给所有人。\nGPU 0: [A B C D] → GPU 0: [A B C D] GPU 1: [ ] GPU 1: [A B C D] GPU 2: [ ] GPU 2: [A B C D] GPU 3: [ ] GPU 3: [A B C D] Reduce Reduce意味着多对一，所有GPU的数据归约到一个GPU。要注意的是它不是拼接而是运算，其最终得到的数据的数据量和原本每个GPU自己的数据量是相同的。Reduce本身并不是一个具体的操作，而是一系列具有特殊性质的规约算子的集合，其满足的性质是为可结合（associative）且通常可交换（commutative）的二元运算。Reduce的常见算子包括了：\nSum（求和） Prod（乘积） Max / Min（极值） Avg（平均） BAND / BOR / BXOR（按位运算） MinLoc / MaxLoc（极值+极值所在位置） LLM训练中99%的Reduce操作都是求和，其他算子出现的极少。NCCL甚至不支持MinLoc / MaxLoc操作。\nGPU 0: [A₀] → GPU 0: [A₀+A₁+A₂+A₃] GPU 1: [A₁] GPU 1: [ ] GPU 2: [A₂] GPU 2: [ ] GPU 3: [A₃] GPU 3: [ ] All-Reduce All-Reduce意味着将所有GPU的数据归约，结果每个GPU都有一份完整拷贝。从逻辑上可以理解为先完成一个Reduce再完成一个Broadcast——实际上的操作在概念上类似但具体实现并不相同，同样是分解为两个阶段，但具体分解成的是Reduce-Scatter和All-Gather。\n"><meta property='og:url' content='https://knightofaxis.github.io/posts/20260405-collectivecommunication/'><meta property='og:site_name' content='Fain的Blog'><meta property='og:type' content='article'><meta property='article:section' content='Posts'><meta property='article:tag' content='vLLM'><meta property='article:tag' content='高性能网络'><meta property='article:published_time' content='2026-04-05T16:39:11+08:00'><meta property='article:modified_time' content='2026-04-05T16:39:11+08:00'><meta name=twitter:title content="LLM 学习日志 #2 集合通信拓扑、原语和实现"><meta name=twitter:description content="这篇博客主要是重温一下之前学过的集合通信的基本模式，包括拓扑、原语和实现。说是“重温”是因为这部分在之前学习NCCL的时候其实就都已经粗略的学习过了，但之后没有用到过，因此掌握不熟练、印象不深。现在趁着Pico-vLLM的开发机会，把这部分知识彻底的掌握起来。\n集合通信的原语 点对点（P2P） Broadcast Broadcast意味着一对多，一个GPU的数据广播给所有人。\nGPU 0: [A B C D] → GPU 0: [A B C D] GPU 1: [ ] GPU 1: [A B C D] GPU 2: [ ] GPU 2: [A B C D] GPU 3: [ ] GPU 3: [A B C D] Reduce Reduce意味着多对一，所有GPU的数据归约到一个GPU。要注意的是它不是拼接而是运算，其最终得到的数据的数据量和原本每个GPU自己的数据量是相同的。Reduce本身并不是一个具体的操作，而是一系列具有特殊性质的规约算子的集合，其满足的性质是为可结合（associative）且通常可交换（commutative）的二元运算。Reduce的常见算子包括了：\nSum（求和） Prod（乘积） Max / Min（极值） Avg（平均） BAND / BOR / BXOR（按位运算） MinLoc / MaxLoc（极值+极值所在位置） LLM训练中99%的Reduce操作都是求和，其他算子出现的极少。NCCL甚至不支持MinLoc / MaxLoc操作。\nGPU 0: [A₀] → GPU 0: [A₀+A₁+A₂+A₃] GPU 1: [A₁] GPU 1: [ ] GPU 2: [A₂] GPU 2: [ ] GPU 3: [A₃] GPU 3: [ ] All-Reduce All-Reduce意味着将所有GPU的数据归约，结果每个GPU都有一份完整拷贝。从逻辑上可以理解为先完成一个Reduce再完成一个Broadcast——实际上的操作在概念上类似但具体实现并不相同，同样是分解为两个阶段，但具体分解成的是Reduce-Scatter和All-Gather。\n"><script>(function(){const e=(new Date).getHours();let t="";e>=5&&e<10?t="/img/morning.png":e>=10&&e<15?t="/img/noon.png":e>=15&&e<20?t="/img/evening.png":t="/img/night.png",document.documentElement.style.setProperty("--bg-image",`url(${t})`)})()</script></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><figure class=site-avatar><a href=/><img src=/img/avatar.jpg width=350 height=350 class=site-logo loading=lazy alt=Avatar>
+</a><span class=emoji>🍥</span></figure><div class=site-meta><h1 class=site-name><a href=/>Fain的Blog</a></h1><h2 class=site-description>博士生在读，vLLM绝赞学习中，目标是成为世一码</h2></div></header><ol class=menu id=main-menu><li><a href=/><span>首页</span></a></li><li><a href=/posts/><span>文章</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav class=toc-nav id=TableOfContents><ul><li><a href=#集合通信的原语>集合通信的原语</a><ul><li><a href=#点对点p2p>点对点（P2P）</a></li><li><a href=#broadcast>Broadcast</a></li><li><a href=#reduce>Reduce</a></li><li><a href=#all-reduce>All-Reduce</a></li><li><a href=#reduce-scatter>Reduce-Scatter</a></li><li><a href=#all-gather>All-Gather</a></li><li><a href=#all-to-all>All-to-All</a></li></ul></li><li><a href=#集合通信的常见拓扑>集合通信的常见拓扑</a><ul><li><a href=#ring环形>Ring（环形）</a></li><li><a href=#tree树形>Tree（树形）</a></li><li><a href=#double-binary-tree>Double Binary Tree</a></li><li><a href=#recursive-halving-doubling>Recursive Halving-Doubling</a></li></ul></li><li><a href=#集合通信的常见实现>集合通信的常见实现</a><ul><li><a href=#cost-model运行时选择>Cost Model：运行时选择</a></li></ul></li><li><a href=#硬件互联的数感建立>硬件互联的数感建立</a><ul><li><a href=#一gpu-节点内互联nvlink>一、GPU 节点内互联：NVLink</a></li><li><a href=#二gpu-节点内互联nvswitch>二、GPU 节点内互联：NVSwitch</a></li><li><a href=#三cpu-gpu-互联pcie>三、CPU-GPU 互联：PCIe</a></li><li><a href=#四节点间互联infiniband>四、节点间互联：InfiniBand</a></li><li><a href=#五节点间互联以太网roce>五、节点间互联：以太网（RoCE）</a></li><li><a href=#六带宽层级>六、带宽层级</a></li><li><a href=#七延迟层级>七、延迟层级</a></li></ul></li></ul></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%AD%A6%E4%B9%A0%E6%97%A5%E5%BF%97/ style=background-color:#d4beef;color:#240f3d>学习日志</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/posts/20260405-collectivecommunication/>LLM 学习日志 #2 集合通信拓扑、原语和实现</a></h2></div><footer class=article-meta><div class=inline-meta><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published datetime=2026-04-05T16:39:11+08:00>Sunday, April 5, 2026</time>
+<svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>6 minutes read</time></div></footer></div></header><aside class=article-toc><details><summary><div class=article-toc-title><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-chevron-right"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M9 6l6 6-6 6"/></svg>
+<span>Table of contents</span></div></summary><nav class=toc-nav><ul><li><a href=#集合通信的原语>集合通信的原语</a><ul><li><a href=#点对点p2p>点对点（P2P）</a></li><li><a href=#broadcast>Broadcast</a></li><li><a href=#reduce>Reduce</a></li><li><a href=#all-reduce>All-Reduce</a></li><li><a href=#reduce-scatter>Reduce-Scatter</a></li><li><a href=#all-gather>All-Gather</a></li><li><a href=#all-to-all>All-to-All</a></li></ul></li><li><a href=#集合通信的常见拓扑>集合通信的常见拓扑</a><ul><li><a href=#ring环形>Ring（环形）</a></li><li><a href=#tree树形>Tree（树形）</a></li><li><a href=#double-binary-tree>Double Binary Tree</a></li><li><a href=#recursive-halving-doubling>Recursive Halving-Doubling</a></li></ul></li><li><a href=#集合通信的常见实现>集合通信的常见实现</a><ul><li><a href=#cost-model运行时选择>Cost Model：运行时选择</a></li></ul></li><li><a href=#硬件互联的数感建立>硬件互联的数感建立</a><ul><li><a href=#一gpu-节点内互联nvlink>一、GPU 节点内互联：NVLink</a></li><li><a href=#二gpu-节点内互联nvswitch>二、GPU 节点内互联：NVSwitch</a></li><li><a href=#三cpu-gpu-互联pcie>三、CPU-GPU 互联：PCIe</a></li><li><a href=#四节点间互联infiniband>四、节点间互联：InfiniBand</a></li><li><a href=#五节点间互联以太网roce>五、节点间互联：以太网（RoCE）</a></li><li><a href=#六带宽层级>六、带宽层级</a></li><li><a href=#七延迟层级>七、延迟层级</a></li></ul></li></ul></nav></details></aside><section class=article-content><p>这篇博客主要是重温一下之前学过的集合通信的基本模式，包括拓扑、原语和实现。说是“重温”是因为这部分在之前学习NCCL的时候其实就都已经粗略的学习过了，但之后没有用到过，因此掌握不熟练、印象不深。现在趁着Pico-vLLM的开发机会，把这部分知识彻底的掌握起来。</p><h2 id=集合通信的原语>集合通信的原语</h2><h3 id=点对点p2p>点对点（P2P）</h3><h3 id=broadcast>Broadcast</h3><p>Broadcast意味着一对多，一个GPU的数据广播给所有人。</p><pre tabindex=0><code>GPU 0: [A B C D] →  GPU 0: [A B C D]
+GPU 1: [       ]    GPU 1: [A B C D]
+GPU 2: [       ]    GPU 2: [A B C D]
+GPU 3: [       ]    GPU 3: [A B C D]
+</code></pre><h3 id=reduce>Reduce</h3><p>Reduce意味着多对一，所有GPU的数据归约到一个GPU。要注意的是它不是拼接而是运算，其最终得到的数据的数据量和原本每个GPU自己的数据量是相同的。Reduce本身并不是一个具体的操作，而是一系列具有特殊性质的规约算子的集合，其满足的性质是为<strong>可结合（associative）且通常可交换（commutative）的二元运算</strong>。Reduce的常见算子包括了：</p><ul><li>Sum（求和）</li><li>Prod（乘积）</li><li>Max / Min（极值）</li><li>Avg（平均）</li><li>BAND / BOR / BXOR（按位运算）</li><li>MinLoc / MaxLoc（极值+极值所在位置）</li></ul><p>LLM训练中99%的Reduce操作都是求和，其他算子出现的极少。NCCL甚至不支持MinLoc / MaxLoc操作。</p><pre tabindex=0><code>GPU 0: [A₀]    →  GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁]       GPU 1: [  ]
+GPU 2: [A₂]       GPU 2: [  ]
+GPU 3: [A₃]       GPU 3: [  ]
+</code></pre><h3 id=all-reduce>All-Reduce</h3><p>All-Reduce意味着将所有GPU的数据归约，结果每个GPU都有一份完整拷贝。从逻辑上可以理解为先完成一个Reduce再完成一个Broadcast——实际上的操作在概念上类似但具体实现并不相同，同样是分解为两个阶段，但具体分解成的是Reduce-Scatter和All-Gather。</p><p>为什么不是一个Reduce+一个Broadcast？实际上，在早期的参数服务器模式下，<strong>确实就是</strong>如此。但它有一个问题：可扩展性。Reduce 阶段所有数据汇聚到一个节点（CPU），Broadcast 阶段再从这一个节点（GPU）发出去。这个节点（GPU）的带宽成为整个操作的瓶颈，其他 GPU 在等待时空闲。Reduce-Scatter+All-Gather模式实际上是通过一个线性的偏移把每一个节点（GPU）变成了一个$1/N$的参数服务器，每个只负责和自己编号相同的第$K$块的数据的Reduce和Broadcast。在集合通信的视角下，这恰好就是Reduce-Scatter+All-Gather的模式。这样讲，可能在概念上是最容易理解的。</p><pre tabindex=0><code>GPU 0: [A₀]    →  GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁]       GPU 1: [A₀+A₁+A₂+A₃]
+GPU 2: [A₂]       GPU 2: [A₀+A₁+A₂+A₃]
+GPU 3: [A₃]       GPU 3: [A₀+A₁+A₂+A₃]
+</code></pre><h3 id=reduce-scatter>Reduce-Scatter</h3><p>Reduce-Scatter操作意味着归约后，结果被切分，每个 GPU 只拿到一部分。但这种简化的描述方式实际上不完全准确，因为理解它在过程中的副产物，比理解它的开始状态和结束状态更有助于理解它是如何运作的。以最经典的ring为例子讲解，一张图会更容易帮助读者理解到底发生了什么：</p><pre tabindex=0><code>每步：每个 GPU 向下一个 GPU 发送一块数据，同时从上一个 GPU 接收一块并求和。
+规则：第 1 步发送自己编号对应的块，之后每步发送刚更新过的块。
+
+初始状态:
+  GPU 0: [A₀  B₀  C₀  D₀]
+  GPU 1: [A₁  B₁  C₁  D₁]
+  GPU 2: [A₂  B₂  C₂  D₂]
+  GPU 3: [A₃  B₃  C₃  D₃]
+
+第 1 步:  GPU 0 ──A₀──→ GPU 1
+          GPU 1 ──B₁──→ GPU 2
+          GPU 2 ──C₂──→ GPU 3
+          GPU 3 ──D₃──→ GPU 0
+
+  GPU 0: [A₀       B₀       C₀       D₀+D₃  ]
+  GPU 1: [A₁+A₀    B₁       C₁       D₁     ]
+  GPU 2: [A₂       B₂+B₁    C₂       D₂     ]
+  GPU 3: [A₃       B₃       C₃+C₂    D₃     ]
+
+第 2 步:  GPU 0 ──D₀₃──→ GPU 1       （发送刚更新的 D 块）
+          GPU 1 ──A₀₁──→ GPU 2       （发送刚更新的 A 块）
+          GPU 2 ──B₁₂──→ GPU 3       （发送刚更新的 B 块）
+          GPU 3 ──C₂₃──→ GPU 0       （发送刚更新的 C 块）
+
+  GPU 0: [A₀            B₀            C₀+C₂₃        D₀₃        ]
+  GPU 1: [A₀₁           B₁            C₁            D₁+D₀₃     ]
+  GPU 2: [A₂+A₀₁        B₁₂           C₂            D₂         ]
+  GPU 3: [A₃            B₃+B₁₂        C₂₃           D₃         ]
+
+第 3 步:  GPU 0 ──C₀₂₃──→ GPU 1      （发送刚更新的 C 块）
+          GPU 1 ──D₀₁₃──→ GPU 2      （发送刚更新的 D 块）
+          GPU 2 ──A₀₁₂──→ GPU 3      （发送刚更新的 A 块）
+          GPU 3 ──B₁₂₃──→ GPU 0      （发送刚更新的 B 块）
+
+  GPU 0: [A₀             B₀₁₂₃=B_all   C₀₂₃           D₀₃        ]
+  GPU 1: [A₀₁            B₁            C₀₁₂₃=C_all    D₀₁₃       ]
+  GPU 2: [A₀₁₂           B₁₂           C₂             D₀₁₂₃=D_all]
+  GPU 3: [A₀₁₂₃=A_all    B₁₂₃          C₂₃            D₃         ]
+规约完成。
+</code></pre><p>因此，它的最终结果就是下图。但需要注意的是，它并不是一个没有副产物的操作。如果是原位操作的话，它实际上会修改每个GPU没有得到最终规约结果的相应数据位置，使得它不再是原本值，而是一个和自身rank决定的偏移量、数据偏移量都相关的部分累加和，也可以和某种意义上的前缀和相类比。</p><pre tabindex=0><code>GPU 0: [A₀ B₀ C₀ D₀]    →  GPU 0: [A₀+A₁+A₂+A₃]
+GPU 1: [A₁ B₁ C₁ D₁]       GPU 1: [B₀+B₁+B₂+B₃]
+GPU 2: [A₂ B₂ C₂ D₂]       GPU 2: [C₀+C₁+C₂+C₃]
+GPU 3: [A₃ B₃ C₃ D₃]       GPU 3: [D₀+D₁+D₂+D₃]
+</code></pre><h3 id=all-gather>All-Gather</h3><p>每个GPU有一部分数据，收集后每个GPU都有完整数据。Ring All-Gather中没有任何归约（求和）操作，每个GPU拿到的块直接原样转发给下一个人就行。每步每个GPU把自己最近收到的完整块沿环传递，N-1步之后每个GPU就收集齐了所有块。</p><pre tabindex=0><code>GPU 0: [A]       →  GPU 0: [A B C D]
+GPU 1: [B]          GPU 1: [A B C D]
+GPU 2: [C]          GPU 2: [A B C D]
+GPU 3: [D]          GPU 3: [A B C D]
+</code></pre><h3 id=all-to-all>All-to-All</h3><p>每个 GPU 向每个其他 GPU 发送不同的数据。由于其$O(n^2)$的通信连接数（有时候还有通信量）和复杂度，其被称为是“集群性能的试金石和考验”。它几乎总是可能引起拥塞。另一方面，大部分运行在集群上的应用都会尽量避免产生频繁的All-to-All通信，因为它很可能严重拉低相较于规整的集合通信模式下的集群性能。对All-to-All的通信优化算法和工程实践思路以处理其产生的拥塞控制为主。此外，就像上一篇的博客中对于MoE的介绍一样，许多All-to-All是动态的而非静态的，从而进一步加剧了这个问题。</p><pre tabindex=0><code>GPU 0: [A₀ A₁ A₂ A₃]    →  GPU 0: [A₀ B₀ C₀ D₀]
+GPU 1: [B₀ B₁ B₂ B₃]       GPU 1: [A₁ B₁ C₁ D₁]
+GPU 2: [C₀ C₁ C₂ C₃]       GPU 2: [A₂ B₂ C₂ D₂]
+GPU 3: [D₀ D₁ D₂ D₃]       GPU 3: [A₃ B₃ C₃ D₃]
+</code></pre><h4 id=all-to-all-v>All-to-All-v</h4><p>每个 GPU 向每个其他 GPU 发送不同的数据，但收发的总数据量不一定每个都相同。</p><h2 id=集合通信的常见拓扑>集合通信的常见拓扑</h2><h3 id=ring环形>Ring（环形）</h3><p>最经典的集合通信的拓扑模式。</p><p>优点是<strong>带宽最优</strong>——每个 GPU 的发送和接收带宽被充分利用，总通信量和 GPU 数无关（都是 2×(N-1)/N × 数据量）。</p><p>缺点是<strong>延迟随 GPU 数线性增长</strong>——步数是 2(N-1)，GPU 越多步数越多。</p><h3 id=tree树形>Tree（树形）</h3><p>优点是<strong>延迟最优</strong>——只需 O(log N) 步。</p><p>缺点是带宽利用率不如 Ring——叶节点只参与部分通信，根节点成为瓶颈。</p><h3 id=double-binary-tree>Double Binary Tree</h3><p>两棵互补的二叉树同时工作，结合了Tree的低延迟和更好的带宽利用率。NCCL在某些场景下会用这种策略。但其复杂且难以理解，而且对集群的节点数量有更严格的要求。</p><h3 id=recursive-halving-doubling>Recursive Halving-Doubling</h3><p>递归地把GPU分成两半，先在小组内归约，再逐步扩大。兼顾延迟和带宽。</p><h2 id=集合通信的常见实现>集合通信的常见实现</h2><p>XCCL：NCCL、HCCL、ACCL...许多初创的CCL通信库实际上都是直接魔改的NCCL。</p><p>NCCL 的 kernel 是沿三个维度<strong>预编译</strong>的模板实例：</p><p><strong>算法（Algorithm）</strong>：决定数据流动的拓扑模式</p><pre tabindex=0><code>Ring:        环形，带宽最优
+Tree:        树形（双二叉树），延迟最优
+CollnetDirect / CollnetChain:  利用 SHARP 等网内计算
+</code></pre><p><strong>协议（Protocol）</strong>：决定数据传输的同步和打包方式</p><pre tabindex=0><code>Simple:   大块传输，高带宽，适合大消息
+LL:       Low Latency，8 字节粒度，用 flag 做同步，适合小消息
+LL128:    128 字节粒度，利用 NVLink 的原子操作，延迟和带宽的折中
+</code></pre><p><strong>归约操作 × 数据类型</strong>：</p><pre tabindex=0><code>Sum/Prod/Max/Min × FP16/BF16/FP32/FP64/INT8/...
+</code></pre><p>这些维度的组合在编译时就被实例化成了大量的 kernel 变体。例如 Ring + Simple + Sum + FP16 是一个 kernel，Tree + LL128 + Max + FP32 是另一个 kernel。这也是为什么 NCCL 的编译时间很长。</p><h3 id=cost-model运行时选择>Cost Model：运行时选择</h3><p>NCCL 的 cost model 是默认调优决策的核心。这个模型以时间为指标评估集合操作的开销，用于选择正确的协议和算法。cost model 考虑多种因素，包括数据量、GPU 架构、拓扑结构、网络和算法属性。</p><p>MSCCL：微软用的一种DSL，基于NCCL自定义通信算法。</p><p>MPI：太经典不讲。</p><h2 id=硬件互联的数感建立>硬件互联的数感建立</h2><p>这一节列举常见网络和网卡设备的所有规格和速度，以帮助读者，包括写博客的我自己，建立对于网络的数字感知。</p><h3 id=一gpu-节点内互联nvlink>一、GPU 节点内互联：NVLink</h3><pre tabindex=0><code>代际          首发GPU     每条链路带宽(双向)  每GPU链路数   每GPU总带宽(双向)
+NVLink 1.0    P100       40 GB/s            4            160 GB/s
+NVLink 2.0    V100       50 GB/s            6            300 GB/s
+NVLink 3.0    A100       50 GB/s            12           600 GB/s
+NVLink 4.0    H100       100 GB/s (注1)     18           900 GB/s
+NVLink 5.0    B200       100 GB/s           18           1,800 GB/s
+NVLink 6.0    Rubin      200 GB/s           18           3,600 GB/s
+
+注1: H100 的 NVLink 4.0 每条链路实际是 50 GB/s 双向，但 NVIDIA 在产品规格中
+     按 sub-link 口径标注为 900 GB/s（18 sub-links × 50 GB/s）。
+     B200 的 NVLink 5.0 SerDes 速率翻倍，同样 18 条但每条 100 GB/s，所以总带宽 1.8 TB/s。
+</code></pre><h3 id=二gpu-节点内互联nvswitch>二、GPU 节点内互联：NVSwitch</h3><pre tabindex=0><code>代际            配套GPU    每芯片端口数    每芯片交换带宽     单节点GPU数   节点总NVLink带宽
+NVSwitch 1.0    V100       18            900 GB/s          8 (DGX-2)     ~2.4 TB/s
+NVSwitch 2.0    A100       36 (注2)      ~3.2 TB/s         8 (DGX A100)  ~4.8 TB/s
+NVSwitch 3.0    H100       64            25.6 Tbps         8 (DGX H100)  ~3.6 TB/s
+NVSwitch 4.0    B200       72 NVLink5    14.4 TB/s         72 (NVL72)    ~130 TB/s (机柜级)
+
+注2: DGX A100 有 6 片 NVSwitch 2.0，每个 A100 的 12 条 NVLink 分别连到 6 片 NVSwitch
+     （每片 2 条），实现 8 GPU 全连接。
+</code></pre><p>NVSwitch 3.0 (Hopper) 开始引入 <strong>SHARP</strong>（Scalable Hierarchical Aggregation and Reduction Protocol），支持在交换芯片内部直接做归约计算（如 All-Reduce 的 sum），数据不需要绕回 GPU。</p><p>NVSwitch 4.0 (Blackwell) 把 NVLink 域从 8 GPU 扩展到了 <strong>72 GPU</strong>（整个机柜），是一个质变——以前跨节点才需要 InfiniBand，现在机柜内全部走 NVLink。</p><h3 id=三cpu-gpu-互联pcie>三、CPU-GPU 互联：PCIe</h3><pre tabindex=0><code>代际        发布年份    每通道速率     x16 单向带宽    x16 双向带宽
+PCIe 3.0    2010       8 GT/s        ~16 GB/s       ~32 GB/s
+PCIe 4.0    2017       16 GT/s       ~32 GB/s       ~64 GB/s
+PCIe 5.0    2019       32 GT/s       ~64 GB/s       ~128 GB/s
+PCIe 6.0    2022       64 GT/s       ~128 GB/s      ~256 GB/s
+PCIe 7.0    2025(规范) 128 GT/s      ~256 GB/s      ~512 GB/s
+</code></pre><p>对比：H100 的 NVLink 总带宽 900 GB/s，而 PCIe 5.0 x16 双向才 128 GB/s，相差 <strong>7 倍</strong>。这就是为什么 TP 必须走 NVLink 而不能走 PCIe。</p><h3 id=四节点间互联infiniband>四、节点间互联：InfiniBand</h3><pre tabindex=0><code>代际       发布年份    每通道速率      4x 链路带宽     单/双向     典型网卡          典型交换机
+SDR        2001       2.5 Gbps       10 Gbps        单向        -                 -
+DDR        2005       5 Gbps         20 Gbps        单向        -                 -
+QDR        2007       10 Gbps        40 Gbps        单向        ConnectX-2/3      -
+FDR        2011       14 Gbps        56 Gbps        单向        ConnectX-3        SwitchX
+EDR        2014       25 Gbps        100 Gbps       单向        ConnectX-4/5      SwitchIB-2
+HDR        2019       50 Gbps        200 Gbps       单向        ConnectX-6        Quantum
+NDR        2022       100 Gbps       400 Gbps       单向        ConnectX-7        Quantum-2
+XDR        2025       200 Gbps       800 Gbps       单向        ConnectX-8        Quantum-X800
+GDR        ~2028      400 Gbps       1.6 Tbps       单向        (规划中)           (规划中)
+</code></pre><p>换算成更直观的单位（双向）：</p><pre tabindex=0><code>EDR:   ~25 GB/s 双向
+HDR:   ~50 GB/s 双向
+NDR:   ~100 GB/s 双向  ← 当前主流 AI 集群配置
+XDR:   ~200 GB/s 双向  ← 2025 年开始部署
+</code></pre><p>一台服务器通常配备<strong>多块网卡</strong>。例如 DGX H100 配 8 张 ConnectX-7 NDR 400G 网卡，每 GPU 一张，节点间总带宽 = 8 × 100 GB/s = <strong>800 GB/s 双向</strong>。即便如此，仍然只有 NVLink (900 GB/s) 的约 89%。</p><h3 id=五节点间互联以太网roce>五、节点间互联：以太网（RoCE）</h3><pre tabindex=0><code>速率          双向带宽       延迟（典型）    备注
+10 GbE        ~2.5 GB/s     ~10-50 μs      传统数据中心
+25 GbE        ~6.25 GB/s    ~5-20 μs       
+40 GbE        ~10 GB/s      ~5-20 μs       
+100 GbE       ~25 GB/s      ~2-10 μs       RoCEv2 常见配置
+200 GbE       ~50 GB/s      ~2-5 μs        
+400 GbE       ~100 GB/s     ~1-3 μs        正在部署
+800 GbE       ~200 GB/s     ~1-2 μs        2025 年开始
+</code></pre><p>以太网 + RoCE（RDMA over Converged Ethernet）是 InfiniBand 的主要替代方案。带宽可以做到类似，但延迟通常高于 InfiniBand，且需要额外的拥塞控制（PFC/ECN）来模拟 IB 的无损特性。</p><p>NVIDIA 的 <strong>Spectrum-X</strong> 平台就是基于以太网的 AI 网络方案，面向不想用 InfiniBand 的客户。</p><h3 id=六带宽层级>六、带宽层级</h3><pre tabindex=0><code>带宽 (GB/s, 双向)     技术                  用途
+─────────────────────────────────────────────────────────
+8,000                 HBM3e (B200)            GPU 内部显存带宽
+3,600                 NVLink 6.0 (Rubin)      机柜内 GPU-GPU (未来)
+1,800                 NVLink 5.0 (B200)       机柜内 GPU-GPU
+  900                 NVLink 4.0 (H100)       节点内 GPU-GPU
+  800                 8×NDR IB (DGX H100)     节点间总带宽
+  600                 NVLink 3.0 (A100)       节点内 GPU-GPU
+  200                 XDR IB (单卡)           节点间单卡带宽
+  128                 PCIe 5.0 x16            CPU-GPU
+  100                 NDR IB (单卡)           节点间单卡带宽
+   50                 HDR IB (单卡)           节点间单卡带宽
+   25                 EDR IB (单卡)           节点间单卡带宽 / 100GbE
+
+数量级关系:
+  HBM 带宽 &gt; NVLink &gt; 多卡 IB 总带宽 &gt; 单卡 IB &gt;&gt; PCIe
+</code></pre><h3 id=七延迟层级>七、延迟层级</h3><p>带宽之外，延迟同样重要：</p><pre tabindex=0><code>操作                               典型延迟
+GPU 内部 SRAM (共享内存) 访问        ~几十 ns
+GPU HBM 访问                        ~100-300 ns
+NVLink GPU-GPU                     ~1-2 μs
+PCIe GPU-CPU                       ~2-5 μs
+InfiniBand RDMA (节点间)            ~1-3 μs
+RoCE (节点间)                       ~2-10 μs
+TCP/IP 以太网 (节点间)              ~10-100 μs
+</code></pre></section><footer class="article-meta article-footer"><section class=article-tags><a href=/tags/vllm/>VLLM</a>
+<a href=/tags/%E9%AB%98%E6%80%A7%E8%83%BD%E7%BD%91%E7%BB%9C/>高性能网络</a></section></footer><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css integrity=sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV crossorigin=anonymous><script src=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js integrity=sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8 crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js integrity=sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05 crossorigin=anonymous defer></script><script>window.addEventListener("DOMContentLoaded",()=>{const e=[".main-article",".widget--toc"];e.forEach(e=>{const t=document.querySelector(e);t&&renderMathInElement(t,{delimiters:[{left:"$$",right:"$$",display:!0},{left:"$",right:"$",display:!1},{left:"\\(",right:"\\)",display:!1},{left:"\\[",right:"\\]",display:!0}],ignoredClasses:["gist"]})})})</script></article><aside><h2 class=section-title>Related content</h2><div class=subsection-list><div class=article-list--tile><article><a href=/posts/20260402-parallelism/><div class=article-details><h2 class=article-title>LLM 学习日志 #1 并行方案和通信模式</h2></div></a></article><article><a href=/posts/20260331-errorsandsolutions/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #9 阶段性总结和开发过程的错误汇总</h2></div></a></article><article><a href=/posts/20260331-preformanceimprovement/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #8 更多Triton Kernel和性能优化</h2></div></a></article><article><a href=/posts/20260330-cudagraph/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #7 CUDA Graph</h2></div></a></article><article><a href=/posts/20260329-triton/><div class=article-details><h2 class=article-title>Pico-vLLM 开发日志 #6 Triton Kernel和代码重构</h2></div></a></article></div></div></aside><div class=disqus-container></div><style>.disqus-container{background-color:var(--card-background);border-radius:var(--card-border-radius);box-shadow:var(--shadow-l1);padding:var(--card-padding)}</style><script>window.addEventListener("onColorSchemeChange",e=>{typeof DISQUS=="object"&&DISQUS.reset({reload:!0})})</script><footer class=site-footer><section class=copyright>&copy;
+2026 Fain的Blog</section><section class=powerby>Built with <a href=https://gohugo.io/ target=_blank rel=noopener>Hugo</a><br>Theme <b><a href=https://github.com/CaiJimmy/hugo-theme-stack target=_blank rel=noopener data-version=4.0.0>Stack</a></b> designed by <a href=https://jimmycai.com target=_blank rel=noopener>Jimmy</a></section></footer><script type=module>
+    import gallery from '\/ts\/gallery.js';
+
+    const articleContent = document.querySelector('.article-content');
+    const shouldLoad = articleContent && (articleContent.querySelectorAll('figure').length > 0 || articleContent.querySelectorAll('img.gallery-image').length > 0);
+    
+    if (shouldLoad) {
+        gallery(articleContent);
+
+        const PhotoSwipeLightbox = (await import("https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe-lightbox.esm.min.js")).default;
+        const styleHref = "https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe.css";
+
+        const styleTag = document.createElement('link');
+        styleTag.rel = 'stylesheet';
+        styleTag.href = styleHref;
+        document.head.appendChild(styleTag);
+
+        const lightbox = new PhotoSwipeLightbox({
+            gallerySelector: '.article-content',
+            childSelector: 'figure a.image-link',
+            pswpModule: () => import("https:\/\/cdn.jsdelivr.net\/npm\/photoswipe@5.4.4\/dist\/photoswipe.esm.min.js")
+        });
+        lightbox.init();
+    }
+</script></main></div><script type=text/javascript src=/ts/main.acaf849f2b273f6a8368a58b001f336738d0c948d92e79b116467d0c7515f932.js defer></script></body></html>
